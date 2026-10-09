@@ -1,0 +1,10 @@
+# Game assets and derived output: never commit (copyrighted, and large)
+extracted/
+out/
+# Build output and cloned reference tools
+build/
+third_party/
+__pycache__/
+tools/bin/
+.pytest_cache/
+.vscode/

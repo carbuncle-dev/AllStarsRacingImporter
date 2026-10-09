@@ -1,0 +1,31 @@
+diff --git a/SeEditor/Forest/ForestTypes.cpp b/SeEditor/Forest/ForestTypes.cpp
+index adcad04..f70307d 100644
+--- a/SeEditor/Forest/ForestTypes.cpp
++++ b/SeEditor/Forest/ForestTypes.cpp
+@@ -2099,7 +2099,7 @@ void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
+             if ((mask & 2) != 0)
+             {
+                 int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
+-                dataSize += 0xC + count * 0x30;
++                dataSize += 0x10 + count * 0x30;  // start quaternion (4 floats), SlMod layout
+                 headerOffset += 4 + (count * 2);
+             }
+             if ((mask & 4) != 0)
+@@ -2136,7 +2136,7 @@ void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
+             if ((mask & 2) != 0)
+             {
+                 int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
+-                dataSize += 0x8 + count * 0x0C;
++                dataSize += 0x4 + count * 0x0C;  // UV rotation: one value
+                 headerOffset += 4 + (count * 2);
+             }
+             if ((mask & 4) != 0)
+@@ -2163,7 +2163,7 @@ void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
+             if ((mask & 1) != 0)
+             {
+                 int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
+-                dataSize += 0x8 + count * 0x0C;
++                dataSize += 0x4 + count * 0x0C;  // one value
+                 headerOffset += 4 + (count * 2);
+             }
+ 

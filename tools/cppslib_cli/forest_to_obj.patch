@@ -1,0 +1,511 @@
+diff --git a/SeEditor/ForestToObj.cpp b/SeEditor/ForestToObj.cpp
+index 948b791..f8e5a44 100644
+--- a/SeEditor/ForestToObj.cpp
++++ b/SeEditor/ForestToObj.cpp
+@@ -19,6 +19,7 @@
+ #include <iostream>
+ #include <iterator>
+ #include <limits>
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -55,9 +56,15 @@ struct ObjVertex
+     Vector3 Pos{};
+     Vector3 Normal{};
+     Vector2 Uv{};
++    // Baked per-vertex colour (D3DCOLOR, usage COLOR): ASR's lighting/shading of the scenery.
++    float Color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
++    bool HasColor = false;
+ };
+ 
+-std::vector<ObjVertex> DecodeVertex(SeEditor::Forest::SuRenderVertexStream const& stream)
++// uvSet: the TEXCOORD usage index the primitive's diffuse texture samples (TextureUvMaps[0].In).
++// Previously every TEXCOORD attribute overwrote the UV, so meshes with a second (lightmap) UV set
++// exported lightmap coordinates for their diffuse texture.
++std::vector<ObjVertex> DecodeVertex(SeEditor::Forest::SuRenderVertexStream const& stream, int uvSet = 0)
+ {
+     std::vector<ObjVertex> verts;
+     if (stream.VertexCount <= 0 || stream.VertexStride <= 0 || stream.Stream.empty())
+@@ -116,8 +123,22 @@ std::vector<ObjVertex> DecodeVertex(SeEditor::Forest::SuRenderVertexStream const
+                                 readU16(off + 4) / 32767.0f};
+                 }
+             }
++            else if (attr.Usage == D3DDeclUsage::Color && attr.UsageIndex == 0 && attr.Type == D3DDeclType::D3DColor)
++            {
++                if (off + 4 <= stream.Stream.size())
++                {
++                    // D3DCOLOR is stored B, G, R, A in memory.
++                    v.Color[0] = stream.Stream[off + 2] / 255.0f;
++                    v.Color[1] = stream.Stream[off + 1] / 255.0f;
++                    v.Color[2] = stream.Stream[off + 0] / 255.0f;
++                    v.Color[3] = stream.Stream[off + 3] / 255.0f;
++                    v.HasColor = true;
++                }
++            }
+             else if (attr.Usage == D3DDeclUsage::TexCoord)
+             {
++                if (attr.UsageIndex != uvSet)
++                    continue;
+                 if (attr.Type == D3DDeclType::Float2)
+                 {
+                     v.Uv = {readFloat(off + 0), readFloat(off + 4)};
+@@ -170,6 +191,17 @@ struct MeshOutput
+     std::shared_ptr<SeEditor::Forest::SuRenderMaterial> Material;
+     std::vector<ObjVertex> Vertices;
+     std::vector<std::uint32_t> Indices;
++    // Where the mesh comes from: forest, tree and branch (bone of the tree's animation).
++    int ForestIndex = -1;
++    int TreeIndex = -1;
++    int BranchIndex = -1;
++    // Texture matrix the diffuse UVs go through (0xFF: none) and its default transform.
++    int UvMatrix = 0xFF;
++    int MatrixIndex = -1;
++    // Texture matrix per texture slot (0xFF: slot unused): multi-layer materials (waterfalls) scroll
++    // each layer with its own UV bone.
++    std::array<int, 4> MatrixIndices{255, 255, 255, 255};
++    SeEditor::Forest::SuTextureTransform Transform{};
+ };
+ 
+ void CompactMesh(MeshOutput& mesh)
+@@ -4230,6 +4262,16 @@ int main(int argc, char** argv)
+             return 4;
+         }
+ 
++    std::shared_ptr<SeEditor::Forest::SuRenderTree> currentTree;
++    int currentForest = -1, currentTreeIndex = -1, currentBranch = -1;
++    // <name>.anims.json: per animated tree, the branch hierarchy with rest transforms and every decoded
++    // animation sample (local T, R quaternion, S, visibility per frame and bone), for rebuilding the
++    // motion as a skeletal animation.
++    std::filesystem::path animsPath = outputPath;
++    animsPath.replace_extension(".anims.json");
++    std::ofstream anims(animsPath);
++    anims << "{\"trees\": [";
++    bool firstAnimTree = true;
+     auto appendMesh = [&](std::shared_ptr<SeEditor::Forest::SuRenderMesh> const& mesh,
+                           Matrix4x4 const& worldMatrix,
+                           std::string const& sourceName) {
+@@ -4241,7 +4283,40 @@ int main(int argc, char** argv)
+             if (!primitive || !primitive->VertexStream)
+                 continue;
+ 
+-            auto verts = DecodeVertex(*primitive->VertexStream);
++            int uvSet = primitive->TextureUvMaps[0].In != 0xFF ? primitive->TextureUvMaps[0].In : 0;
++            if (std::getenv("FOREST_TO_OBJ_DEBUG_UV") && primitive->Material)
++            {
++                int mi = primitive->TextureMatrixIndices[0];
++                std::cerr << "UVDBG " << primitive->Material->Name << " uvIn=" << int(primitive->TextureUvMaps[0].In)
++                          << " uvMat=" << int(primitive->TextureUvMaps[0].Mat) << " matIdx=" << mi;
++                if (currentTree && mi < static_cast<int>(currentTree->DefaultTextureTransforms.size()))
++                {
++                    auto const& t = currentTree->DefaultTextureTransforms[static_cast<std::size_t>(mi)];
++                    std::cerr << " pos=(" << t.PosU << "," << t.PosV << ") angle=" << t.Angle << " scale=(" << t.ScaleU << "," << t.ScaleV << ")";
++                }
++                for (int k = 1; k < 4; ++k)
++                    std::cerr << " slot" << k << "(in=" << int(primitive->TextureUvMaps[k].In) << " mat="
++                              << int(primitive->TextureUvMaps[k].Mat) << " idx=" << int(primitive->TextureMatrixIndices[k]) << ")";
++                for (int k = 1; k < 3; ++k)
++                {
++                    int mk = primitive->TextureMatrixIndices[k];
++                    if (currentTree && mk < static_cast<int>(currentTree->DefaultTextureTransforms.size()))
++                    {
++                        auto const& t = currentTree->DefaultTextureTransforms[static_cast<std::size_t>(mk)];
++                        std::cerr << " t" << k << "=(" << t.PosU << "," << t.PosV << "," << t.Angle << "," << t.ScaleU << "," << t.ScaleV << ")";
++                    }
++                }
++                std::cerr << '\n';
++            }
++            if (std::getenv("FOREST_TO_OBJ_DEBUG_ATTR") && primitive->Material)
++            {
++                std::cerr << "ATTRDBG " << sourceName << " " << primitive->Material->Name;
++                for (auto const& a : primitive->VertexStream->AttributeStreamsInfo)
++                    std::cerr << " u" << int(a.Usage) << "." << int(a.UsageIndex) << ":t" << int(a.Type)
++                              << "@" << a.Offset << "/s" << int(a.Stream);
++                std::cerr << " stride=" << primitive->VertexStream->VertexStride << "\n";
++            }
++            auto verts = DecodeVertex(*primitive->VertexStream, uvSet);
+             if (verts.empty())
+                 continue;
+ 
+@@ -4464,6 +4539,16 @@ int main(int argc, char** argv)
+             else
+                 meshOut.MaterialName = meshOut.Name;
+             meshOut.Material = primitive->Material;
++            meshOut.ForestIndex = currentForest;
++            meshOut.TreeIndex = currentTreeIndex;
++            meshOut.BranchIndex = currentBranch;
++            meshOut.UvMatrix = primitive->TextureUvMaps[0].Mat;
++            meshOut.MatrixIndex = primitive->TextureMatrixIndices[0];
++            for (int k = 0; k < 4; ++k)
++                meshOut.MatrixIndices[static_cast<std::size_t>(k)] =
++                    primitive->TextureUvMaps[k].In != 0xFF ? int(primitive->TextureMatrixIndices[k]) : 255;
++            if (currentTree && meshOut.MatrixIndex < static_cast<int>(currentTree->DefaultTextureTransforms.size()))
++                meshOut.Transform = currentTree->DefaultTextureTransforms[static_cast<std::size_t>(meshOut.MatrixIndex)];
+             meshOut.Vertices = std::move(verts);
+             meshOut.Indices = std::move(validIndices);
+             outputs.emplace_back(std::move(meshOut));
+@@ -4481,8 +4566,82 @@ int main(int argc, char** argv)
+             auto const& tree = trees[treeIdx];
+             if (!tree)
+                 continue;
++            currentTree = tree;
++            currentForest = static_cast<int>(forestIdx);
++            currentTreeIndex = static_cast<int>(treeIdx);
+ 
+             std::size_t branchCount = tree->Branches.size();
++            if (!tree->AnimationEntries.empty())
++            {
++                anims << (firstAnimTree ? "" : ",") << "\n {\"forest\": " << forestIdx << ", \"forest_name\": \""
++                      << forestEntry.Name << "\", \"tree\": " << treeIdx << ", \"branches\": [";
++                for (std::size_t b = 0; b < branchCount; ++b)
++                {
++                    auto const& br = tree->Branches[b];
++                    Vector4 t{}, r{0, 0, 0, 1}, sc{1, 1, 1, 1};
++                    if (b < tree->Translations.size()) t = tree->Translations[b];
++                    if (b < tree->Rotations.size()) r = tree->Rotations[b];
++                    if (b < tree->Scales.size()) sc = tree->Scales[b];
++                    std::string bname = br ? br->Name : std::string();
++                    for (char& c : bname)
++                        if (c == '"' || c == '\\') c = '_';
++                    anims << (b ? "," : "") << "\n  {\"name\": \"" << bname << "\", \"parent\": " << (br ? br->Parent : -1)
++                          << ", \"t\": [" << t.X << "," << t.Y << "," << t.Z << "], \"r\": [" << r.X << "," << r.Y << ","
++                          << r.Z << "," << r.W << "], \"s\": [" << sc.X << "," << sc.Y << "," << sc.Z << "]}";
++                }
++                anims << "], \"animations\": [";
++                bool firstAnim = true;
++                for (auto const& entry : tree->AnimationEntries)
++                {
++                    if (!entry.Animation)
++                        continue;
++                    auto& animation = *entry.Animation;
++                    bool ok = animation.DecodeType6Samples(*tree);
++                    anims << (firstAnim ? "" : ",") << "\n  {\"name\": \"" << entry.AnimName << "\", \"type\": " << animation.Type
++                          << ", \"frames\": " << animation.NumFrames << ", \"bones\": " << animation.NumBones
++                          << ", \"uv_bones\": " << animation.NumUvBones << ", \"float_streams\": " << animation.NumFloatStreams
++                          << ", \"decoded\": " << (ok ? "true" : "false");
++                    // Raw cubic-animation data (types 1 and 4 are not decoded by CppSLib): channel masks,
++                    // key headers (AnimStreams) and coefficient data.
++                    auto list = [&](char const* key, auto const& v) {
++                        anims << ", \"" << key << "\": [";
++                        for (std::size_t i = 0; i < v.size(); ++i)
++                            anims << (i ? "," : "") << v[i];
++                        anims << "]";
++                    };
++                    list("masks", animation.ChannelMasks);
++                    list("streams", animation.AnimStreams);
++                    list("float_data", animation.FloatFrameData);
++                    list("vector_offsets", animation.VectorOffsets);
++                    anims << ", \"vector_data\": [";
++                    for (std::size_t i = 0; i < animation.VectorFrameData.size(); ++i)
++                    {
++                        auto const& v = animation.VectorFrameData[i];
++                        anims << (i ? "," : "") << v.X << "," << v.Y << "," << v.Z << "," << v.W;
++                    }
++                    anims << "], \"samples\": [";
++                    for (int f = 0; ok && f < animation.NumFrames; ++f)
++                    {
++                        anims << (f ? "," : "") << "\n   [";
++                        for (int bone = 0; bone < animation.NumBones; ++bone)
++                        {
++                            auto const* smp = animation.GetSample(f, bone);
++                            anims << (bone ? "," : "") << "[";
++                            if (smp)
++                                anims << smp->Translation.X << "," << smp->Translation.Y << "," << smp->Translation.Z << ","
++                                      << smp->Rotation.X << "," << smp->Rotation.Y << "," << smp->Rotation.Z << ","
++                                      << smp->Rotation.W << "," << smp->Scale.X << "," << smp->Scale.Y << "," << smp->Scale.Z
++                                      << "," << (smp->Visible ? 1 : 0);
++                            anims << "]";
++                        }
++                        anims << "]";
++                    }
++                    anims << "]}";
++                    firstAnim = false;
++                }
++                anims << "]}";
++                firstAnimTree = false;
++            }
+             std::vector<Matrix4x4> world(branchCount);
+             std::vector<bool> computed(branchCount, false);
+             auto computeWorld = [&](auto&& self, int idx) -> Matrix4x4 {
+@@ -4500,6 +4659,14 @@ int main(int argc, char** argv)
+                     r = tree->Rotations[static_cast<std::size_t>(idx)];
+                 if (static_cast<std::size_t>(idx) < tree->Scales.size())
+                     s = tree->Scales[static_cast<std::size_t>(idx)];
++                // Placed objects (item.Forest) can rest at scale 0 (balloons grow in when spawned):
++                // baking that collapsed their meshes to a point. Keep their shape (unit scale).
++                if (forestEntry.Name == "item.Forest")
++                {
++                    s.X = SanitizeScale(s.X);
++                    s.Y = SanitizeScale(s.Y);
++                    s.Z = SanitizeScale(s.Z);
++                }
+ 
+                 Matrix4x4 local = BuildLocalMatrix(t, r, s);
+                 int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+@@ -4517,14 +4684,41 @@ int main(int argc, char** argv)
+                 return world[static_cast<std::size_t>(idx)];
+             };
+ 
++            // LOD branches point at one child subtree per threshold; exporting all of them stacks
++            // every detail level on top of each other. Keep the nearest (most detailed) one only.
++            bool const allLods = std::getenv("FOREST_TO_OBJ_ALL_LODS") != nullptr;
++            std::vector<bool> coarseLod(branchCount, false);
++            auto markSubtree = [&](auto&& self, int idx) -> void {
++                if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount ||
++                    coarseLod[static_cast<std::size_t>(idx)])
++                    return;
++                coarseLod[static_cast<std::size_t>(idx)] = true;
++                auto const& b = tree->Branches[static_cast<std::size_t>(idx)];
++                if (!b)
++                    return;
++                for (int c = b->Child; c >= 0 && static_cast<std::size_t>(c) < branchCount;)
++                {
++                    self(self, c);
++                    auto const& cb = tree->Branches[static_cast<std::size_t>(c)];
++                    c = cb ? cb->Sibling : -1;
++                }
++            };
++            if (!allLods)
++                for (auto const& b : tree->Branches)
++                    if (b && b->Lod)
++                        for (std::size_t t = 1; t < b->Lod->Thresholds.size(); ++t)
++                            if (auto const& th = b->Lod->Thresholds[t])
++                                markSubtree(markSubtree, th->ChildBranch);
++
+             std::size_t treeMeshStart = outputs.size();
+             for (std::size_t branchIdx = 0; branchIdx < branchCount; ++branchIdx)
+             {
+                 Matrix4x4 worldMatrix = computeWorld(computeWorld, static_cast<int>(branchIdx));
+                 auto const& branch = tree->Branches[branchIdx];
+-                if (!branch)
++                if (!branch || coarseLod[branchIdx])
+                     continue;
+ 
++                currentBranch = static_cast<int>(branchIdx);
+                 if (branch->Mesh)
+                     appendMesh(branch->Mesh, worldMatrix,
+                                forestEntry.Name.empty() ? ("forest" + std::to_string(forestIdx))
+@@ -4533,6 +4727,18 @@ int main(int argc, char** argv)
+                 {
+                     for (auto const& threshold : branch->Lod->Thresholds)
+                     {
++                        if (!allLods && threshold != branch->Lod->Thresholds.front())
++                            break;
++                        if (std::getenv("FOREST_TO_OBJ_DEBUG_LOD") && threshold)
++                        {
++                            std::cerr << "LODDBG " << forestEntry.Name << " branch=" << branchIdx
++                                      << " dist=" << threshold->ThresholdDistance << " child=" << threshold->ChildBranch;
++                            if (threshold->Mesh)
++                                for (auto const& prim : threshold->Mesh->Primitives)
++                                    if (prim && prim->Material)
++                                        std::cerr << " " << prim->Material->Name;
++                            std::cerr << '\n';
++                        }
+                         if (threshold && threshold->Mesh)
+                             appendMesh(threshold->Mesh, worldMatrix,
+                                        forestEntry.Name.empty() ? ("forest" + std::to_string(forestIdx))
+@@ -4542,6 +4748,7 @@ int main(int argc, char** argv)
+             }
+         }
+     }
++    anims << "\n]}\n";
+     }
+ 
+     if ((bigEndian || ps3ByName) && enablePs3TriangleFilter && !outputs.empty())
+@@ -4592,6 +4799,22 @@ int main(int argc, char** argv)
+             return std::string("tex_") + std::to_string(++anonTextureCounter) + ".dds";
+         };
+ 
++        if (std::getenv("FOREST_TO_OBJ_DEBUG_TEX"))
++        {
++            std::cerr << "TEXDBG " << mat->Name << " psflags=" << mat->PixelShaderFlags;
++            for (std::size_t li = 0; li < mat->Layers.size(); ++li)
++            {
++                std::cerr << " L" << li << "[";
++                for (int v : mat->Layers[li])
++                    std::cerr << v << ",";
++                std::cerr << "]";
++            }
++            for (auto const& tex : mat->Textures)
++                if (tex && tex->TextureResource)
++                    std::cerr << " | " << tex->TextureResource->Name << " f=" << tex->Flags << " p=" << tex->Param0
++                              << "," << tex->Param1 << "," << tex->Param2;
++            std::cerr << std::endl;
++        }
+         for (auto const& tex : mat->Textures)
+         {
+             if (!tex || !tex->TextureResource)
+@@ -4652,6 +4875,30 @@ int main(int argc, char** argv)
+ 
+     obj << "mtllib " << mtlPath.filename().string() << '\n';
+ 
++    // <name>.vcol: exact vertex colours incl. alpha (OBJ has no alpha, and colour-managed paths
++    // altered the values), one record per OBJ "v" line: float32 x, y, z, r, g, b, a.
++    std::filesystem::path vcolPath = outputPath;
++    vcolPath.replace_extension(".vcol");
++    std::ofstream vcol(vcolPath, std::ios::binary);
++
++    // Different materials can share a name (Rocky Coaster's balloons: "Orange_Balloon_T_Balloon1" with
++    // BALLON_DF_ORANGE on one tree and BALLON_DF_RED on another). Name-keyed consumers (MTL, Blender,
++    // Unreal) merged them, so every balloon came out orange: a same-named material with a different
++    // diffuse texture gets "_<texture>" appended. Identical duplicates keep the shared name.
++    {
++        std::map<std::string, std::string> firstTexture;  // name -> diffuse texture of its first user
++        for (auto& mesh : outputs)
++        {
++            std::string base = mesh.MaterialName.empty() ? mesh.Name : mesh.MaterialName;
++            std::string tex = std::filesystem::path(writeTextureForMaterial(mesh.Material)).stem().string();
++            auto it = firstTexture.find(base);
++            if (it == firstTexture.end())
++                firstTexture.emplace(base, tex);
++            else if (it->second != tex && !tex.empty())
++                mesh.MaterialName = base + "_" + tex;
++        }
++    }
++
+     std::size_t vertexBase = 1;
+     for (auto const& mesh : outputs)
+     {
+@@ -4671,8 +4918,22 @@ int main(int argc, char** argv)
+                 << "\n\n";
+         else
+             mtl << "\n";
++        bool colored = std::any_of(mesh.Vertices.begin(), mesh.Vertices.end(), [](ObjVertex const& v) { return v.HasColor; });
+         for (auto const& v : mesh.Vertices)
+-            obj << "v " << v.Pos.X << ' ' << v.Pos.Y << ' ' << v.Pos.Z << '\n';
++        {
++            obj << "v " << v.Pos.X << ' ' << v.Pos.Y << ' ' << v.Pos.Z;
++            // OBJ vertex-colour extension (read by Blender's importer). ASR modulates by 2x the vertex
++            // colour, so meshes without one get the neutral 0.5 (meshes joined per material need the
++            // same attributes).
++            if (colored)
++                obj << ' ' << v.Color[0] << ' ' << v.Color[1] << ' ' << v.Color[2];
++            else
++                obj << " 0.5 0.5 0.5";
++            obj << '\n';
++            float rec[7] = {v.Pos.X, v.Pos.Y, v.Pos.Z, colored ? v.Color[0] : 0.5f, colored ? v.Color[1] : 0.5f,
++                            colored ? v.Color[2] : 0.5f, colored ? v.Color[3] : 1.0f};
++            vcol.write(reinterpret_cast<char const*>(rec), sizeof(rec));
++        }
+         for (auto const& v : mesh.Vertices)
+             obj << "vn " << v.Normal.X << ' ' << v.Normal.Y << ' ' << v.Normal.Z << '\n';
+         for (auto const& v : mesh.Vertices)
+@@ -4694,6 +4955,118 @@ int main(int argc, char** argv)
+         vertexBase += mesh.Vertices.size();
+     }
+ 
++    // Sidecar for the material conversion: ASR shader settings per material, and per mesh chunk the
++    // texture matrix use and vertex-colour statistics (alpha is not representable in OBJ).
++    {
++        std::filesystem::path infoPath = outputPath;
++        infoPath.replace_extension(".materials.json");
++        std::ofstream info(infoPath);
++        auto jstr = [](std::string const& t) {
++            std::string o = "\"";
++            for (char c : t)
++            {
++                if (c == '"' || c == '\\')
++                    o += '\\';
++                o += c;
++            }
++            return o + "\"";
++        };
++        info << "{\"materials\": {";
++        std::map<std::string, std::shared_ptr<SeEditor::Forest::SuRenderMaterial>> mats;
++        for (auto const& mesh : outputs)
++            if (mesh.Material)
++                mats.emplace(SanitizeName(mesh.MaterialName.empty() ? mesh.Name : mesh.MaterialName), mesh.Material);
++        bool first = true;
++        for (auto const& [name, m] : mats)
++        {
++            // Every texture the material uses (normal, specular, environment, glow maps), not just the
++            // diffuse one referenced by the .mtl.
++            for (auto const& t : m->Textures)
++            {
++                if (!t || !t->TextureResource)
++                    continue;
++                std::string fname = std::filesystem::path(t->TextureResource->Name).filename().string();
++                if (fname.empty())
++                    continue;
++                if (std::filesystem::path(fname).extension().empty())
++                    fname += ".dds";
++                std::string key = lowerName(fname);
++                if (writtenTextures.count(key))
++                    continue;
++                std::vector<std::uint8_t> bytes = t->TextureResource->ImageData;
++                if (bytes.empty())
++                {
++                    auto it = pcTextureFallback.find(key);
++                    if (it != pcTextureFallback.end())
++                        bytes = it->second;
++                }
++                if (bytes.empty())
++                    continue;
++                std::ofstream texOut(outputPath.parent_path() / fname, std::ios::binary);
++                texOut.write(reinterpret_cast<char const*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++                writtenTextures.emplace(key, fname);
++            }
++            info << (first ? "" : ",") << "\n " << jstr(name) << ": {\"psflags\": " << m->PixelShaderFlags
++                 << ", \"hash\": " << m->Hash << ", \"floats\": [";
++            for (std::size_t i = 0; i < m->FloatList.size(); ++i)
++                info << (i ? ", " : "") << m->FloatList[i];
++            info << "], \"layers\": [";
++            for (std::size_t li = 0; li < m->Layers.size(); ++li)
++            {
++                info << (li ? ", " : "") << "[";
++                for (std::size_t k = 0; k < m->Layers[li].size(); ++k)
++                    info << (k ? ", " : "") << m->Layers[li][k];
++                info << "]";
++            }
++            info << "], \"unknown\": [" << m->Unknown_0x44 << ", " << m->Unknown_0x48 << ", " << m->Unknown_0x4c << ", "
++                 << int(m->Unknown_0x51) << ", " << m->Unknown_0x54 << ", " << m->Unknown_0x64 << ", "
++                 << int(m->Unknown_0x68) << ", " << int(m->Unknown_0x69) << ", " << int(m->Unknown_0x6a) << ", "
++                 << int(m->Unknown_0x6b) << "], \"textures\": [";
++            bool tfirst = true;
++            for (auto const& t : m->Textures)
++            {
++                if (!t)
++                    continue;
++                info << (tfirst ? "" : ", ") << "{\"name\": " << jstr(t->TextureResource ? t->TextureResource->Name : "")
++                     << ", \"flags\": " << t->Flags << ", \"params\": [" << t->Param0 << ", " << t->Param1 << ", "
++                     << t->Param2 << "]}";
++                tfirst = false;
++            }
++            info << "]}";
++            first = false;
++        }
++        info << "\n}, \"meshes\": [";
++        first = true;
++        for (auto const& mesh : outputs)
++        {
++            double sum[4] = {0, 0, 0, 0};
++            float amin = 1.0f;
++            bool colored = false;
++            for (auto const& v : mesh.Vertices)
++            {
++                colored |= v.HasColor;
++                for (int c = 0; c < 4; ++c)
++                    sum[c] += v.Color[c];
++                amin = std::min(amin, v.Color[3]);
++            }
++            double n = static_cast<double>(std::max<std::size_t>(mesh.Vertices.size(), 1));
++            info << (first ? "" : ",") << "\n {\"name\": " << jstr(SanitizeName(mesh.Name)) << ", \"material\": "
++                 << jstr(SanitizeName(mesh.MaterialName.empty() ? mesh.Name : mesh.MaterialName))
++                 << ", \"forest\": " << mesh.ForestIndex << ", \"tree\": " << mesh.TreeIndex
++                 << ", \"branch\": " << mesh.BranchIndex
++                 << ", \"uv_matrix\": " << mesh.UvMatrix << ", \"matrix_index\": " << mesh.MatrixIndex
++                 << ", \"matrix_indices\": [" << mesh.MatrixIndices[0] << ", " << mesh.MatrixIndices[1] << ", "
++                 << mesh.MatrixIndices[2] << ", " << mesh.MatrixIndices[3] << "]"
++                 << ", \"transform\": [" << mesh.Transform.PosU << ", " << mesh.Transform.PosV << ", " << mesh.Transform.Angle
++                 << ", " << mesh.Transform.ScaleU << ", " << mesh.Transform.ScaleV << "], \"colored\": "
++                 << (colored ? "true" : "false") << ", \"color_mean\": [" << sum[0] / n << ", " << sum[1] / n << ", "
++                 << sum[2] / n << ", " << sum[3] / n << "], \"alpha_min\": " << amin << ", \"vertices\": "
++                 << mesh.Vertices.size() << "}";
++            first = false;
++        }
++        info << "\n]}\n";
++    }
++
+     std::cout << "Exported " << outputs.size() << " mesh chunks to " << outputPath << ".\n";
+     return 0;
+ }
