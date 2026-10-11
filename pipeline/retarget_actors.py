@@ -30,6 +30,8 @@ from cw.collision import parse_collision
 from cw.navigation import parse_navigation
 from pipeline.asr_to_cw import START_SHIFTS, TEMPLATE_DIR, drivable_triangles, main_route, road_extent
 
+ROOT = Path(__file__).resolve().parent.parent
+
 FIXED_RANGE = 300.0
 
 
@@ -188,6 +190,26 @@ ROAD_SEARCH = 40.0   # m, how far from the mapped spot an on-road actor looks fo
 WORLD_UP = np.array([0.0, 1.0, 0.0])   # actors within this height of the template road keep their height above the surface
 
 
+def map_lap(s: float, src: Route, dst: Route) -> float:
+    """Lap distance on the template route -> ours (absolute near the start/finish, proportional elsewhere)."""
+    if s <= FIXED_RANGE:
+        return s
+    if src.length - s <= FIXED_RANGE:
+        return dst.length - (src.length - s)
+    return s * dst.length / src.length
+
+
+def map_pose(location_ue, rotation, src: Route, dst: Route):
+    """A free pose (camera) relative to the template's road -> the same relative pose on ours: same lap
+    position (map_lap), sideways offset and height, orientation kept relative to the road frame."""
+    p = ue_to_cw(location_ue)
+    s, lat, h, k = src.locate(p)
+    o2, d2, u2, lat2 = dst.at(map_lap(s, src, dst))
+    _, d1, u1, latv1 = src.frame(k)
+    rel = road_basis(d1, u1, latv1).T @ rotator_to_matrix(*rotation)
+    return cw_to_ue(o2 + lat2 * lat + u2 * h), matrix_to_rotator(road_basis(d2, u2, lat2) @ rel)
+
+
 def _unit(v):
     v = np.asarray(v, float)
     return v / np.linalg.norm(v)
@@ -338,6 +360,113 @@ def thin_item_boxes(moved: list[dict]) -> list[dict]:
     return moved
 
 
+# Rocky Coaster's own item boxes and boost pads (ASR logic locators, asr.logic): item.Forest tree 0 is
+# an item box (16 = four rows of four), tree 3 a boost pad. They replace the retargeted E-Stadium layout:
+# every item-box level shows ASR's rows (a level with fewer boxes than ASR keeps the middle boxes of
+# each row), the dash panel nearest each ASR pad moves onto it. Rings stay as retargeted.
+ASR_ITEM_BOX, ASR_PAD = 0, 3
+ROW_GAP = 15.0    # m along the lap between ASR's item-box rows (boxes of a row are ~3.5 m apart)
+
+
+def asr_slots(converted: Path, sif: Path) -> dict[int, list[np.ndarray]]:
+    """item.Forest tree -> CW positions of its ASR locators."""
+    from asr.logic import parse_logic
+    from asr.sif import read_sif
+    from pipeline.asr_objects import item_tree_hashes
+    a = json.loads((converted / "align.json").read_text())
+    rot, off = np.array(a["rotation"]), np.array(a["offset"])
+    trees = item_tree_hashes(sif)
+    out: dict[int, list[np.ndarray]] = {}
+    for loc in parse_logic(read_sif(sif)["LOGC"]):
+        t = trees.get(loc.tree)
+        if t is not None:
+            out.setdefault(t, []).append(rot @ np.array(loc.position) + off)
+    return out
+
+
+def _on_road(p, dst: Route, height: float):
+    """(UE location, UE rotator) of a spot `height` m above our road at CW point p, facing along the lap."""
+    s, lat, _, k = dst.locate(p)
+    o, d, u, latv = dst.at(s)
+    hit = surface_hit(p, u, dst.road, reach=ROAD_SEARCH)
+    n = u
+    if hit is not None:
+        p, n = hit[0], hit[1]
+    return cw_to_ue(p + n * height), matrix_to_rotator(road_basis(d, n, latv)), s
+
+
+def apply_asr_layout(result: dict, slots: dict, dst: Route, visual=None) -> None:
+    boxes = slots.get(ASR_ITEM_BOX, [])
+    if boxes:
+        # rows: consecutive boxes along the lap, ordered across the road
+        laps = [dst.locate(p)[:2] for p in boxes]
+        order = sorted(range(len(boxes)), key=lambda i: laps[i][0])
+        rows, cur = [], [order[0]]
+        for i in order[1:]:
+            if abs(laps[i][0] - laps[cur[-1]][0]) > ROW_GAP:
+                rows.append(cur)
+                cur = []
+            cur.append(i)
+        rows.append(cur)
+        rows = [sorted(r, key=lambda i: laps[i][1]) for r in rows]
+    for level, moved in result.items():
+        items = [m for m in moved if m["class"] == "BP_ItemBox_C" and not m.get("unplaced")]
+        if boxes and items:
+            # box height above the road: as the retargeted E-Stadium boxes stand
+            heights = []
+            for m in items:
+                if m.get("delete"):
+                    continue
+                q = ue_to_cw(m["location"])
+                hit = surface_hit(q, dst.at(dst.locate(q)[0])[2], dst.road, reach=ROAD_SEARCH)
+                if hit is not None:
+                    heights.append((q - hit[0]) @ hit[1])
+            height = float(np.median(heights)) if heights else 1.5
+            # E-Stadium stacks boxes on one spot (the final lap: 59 boxes on 24 spots). The level patcher finds
+            # boxes by their stock position, so a stack moves as a whole: one ASR slot per stack (split stacks were
+            # skipped, and the final lap showed 7 boxes against 12 on the other laps).
+            stacks: dict[tuple, list] = {}
+            for m in items:
+                stacks.setdefault(tuple(round(v) for v in m["from"]), []).append(m)
+            groups = list(stacks.values())
+            per_row = min(max(len(r) for r in rows), len(groups) // len(rows))
+            chosen = []
+            for r in rows:
+                drop = len(r) - per_row
+                chosen += r[drop // 2: len(r) - (drop - drop // 2)]
+            for group, i in zip(groups, chosen):
+                loc, rot, s = _on_road(boxes[i], dst, height)
+                for m in group:
+                    m.update(location=loc, rotation=rot, delete=False)
+                    m["lap_distance"] = [m["lap_distance"][0], round(s, 1)]
+            for group in groups[len(chosen):]:
+                for m in group:
+                    m["delete"] = True
+                    m["location"], m["rotation"] = m["from"], m["from_rotation"]
+            placed = sum(len(g) for g in groups[:len(chosen)])
+            print(f"   {level.split('/')[-1]}: {len(chosen)} item-box spots ({placed} boxes) at ASR's {len(rows)} rows, "
+                  f"{len(items) - placed} sunk")
+        pads = [m for m in moved if m["class"] in PAD_CLASSES and not m.get("delete")]
+        for p in slots.get(ASR_PAD, []) if pads else []:
+            s0 = dst.locate(p)[0]
+            m = min(pads, key=lambda m: abs((m["lap_distance"][1] - s0 + dst.length / 2) % dst.length - dst.length / 2))
+            # keep the pad's own height above the road (its pivot sits ~0.4 m above the surface)
+            q = ue_to_cw(m["location"])
+            hit = surface_hit(q, dst.at(dst.locate(q)[0])[2], dst.road, reach=ROAD_SEARCH)
+            height = float((q - hit[0]) @ hit[1]) if hit is not None else 0.4
+            loc, rot, s = _on_road(p, dst, height)
+            if visual is not None:
+                cw_rot = np.column_stack([_unit(ue_to_cw(rotator_to_matrix(*rot)[:, k])) for k in range(3)])
+                fit = fit_pad(ue_to_cw(loc), cw_rot, height, visual)
+                if fit is not None:
+                    loc = cw_to_ue(fit[0])
+                    rot = matrix_to_rotator(np.column_stack([_unit(cw_to_ue(fit[1][:, k])) for k in range(3)]))
+            print(f"   {level.split('/')[-1]}: {m['label']} lap {m['lap_distance'][1]:.0f} -> ASR pad at {s:.0f}")
+            m.update(location=loc, rotation=rot)
+            m["lap_distance"] = [m["lap_distance"][0], round(s, 1)]
+            pads.remove(m)
+
+
 # Gimmicks whose physical shape lives in the stage's Bullet collision rather than on the actor
 # (jump-stand ramps and their triggers, blockers, final-lap road additions). Dash panels and
 # rings have no collision chunks -- their effect comes from the actor.
@@ -387,6 +516,8 @@ def main() -> None:
     ap.add_argument("--collision", action="store_true",
                     help="also move the template's gimmick collision chunks into the converted collision files")
     ap.add_argument("--levels", type=Path, help="legacy-extracted object levels (see pipeline.patch_object_levels)")
+    ap.add_argument("--sif", type=Path, help="the ASR track (.sif): its item boxes and boost pads replace the "
+                    "template's (default: extracted/asr/**/<Track>.sif)")
     ap.add_argument("--visual", type=Path, help="the track's OBJ (forest_to_obj; default: <converted>/../*.obj) "
                     "to rest boost pads on the visible surface")
     args = ap.parse_args()
@@ -411,6 +542,9 @@ def main() -> None:
         visual = load(obj, args.converted / "align.json")
         print(f"visible track: {len(visual)} triangles from {obj.name}")
     result = retarget(actors, src, dst, visual)
+    sif = args.sif or next(iter(sorted((ROOT / "extracted" / "asr").rglob(f"{args.converted.parent.name.replace('samba_', 'Samba_')}.sif"))), None)
+    if sif:
+        apply_asr_layout(result, asr_slots(args.converted, sif), dst, visual)
     args.out.write_text(json.dumps(result, indent=1))
     if args.collision:
         from cw.collision import write_collision

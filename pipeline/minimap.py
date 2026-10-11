@@ -207,9 +207,15 @@ def finish_line(img: Image.Image, track_dir: Path, size: float, centre: np.ndarr
     fwd = np.array([d[2], -d[0]])                  # -> UE X, Y
     fwd /= np.linalg.norm(fwd)
     side = np.array([-fwd[1], fwd[0]])
-    half_w, cell = 1300.0, 260.0     # cm: across the road, square size
+    # cm. Like the stock maps' flag (E-Stadium's, measured on its 1024 px map at 68 cm/px): 8 x 2 squares
+    # of 8 px (5.5 m), 64 px across (wider than the road), a 1 px black outline, the top row starting white.
+    half_w, cols, rim = 2190.0, 8, 70.0
+    cell = 2 * half_w / cols
     dr = ImageDraw.Draw(img)
-    cols = int(2 * half_w / cell)
+    a = pos - side * (half_w + rim) - fwd * (cell + rim)
+    w, h = 2 * (half_w + rim), 2 * (cell + rim)
+    outline = project(np.array([a, a + side * w, a + side * w + fwd * h, a + fwd * h]), size, centre)
+    dr.polygon([tuple(v) for v in outline], fill=(20, 20, 20, 255))
     for r in range(2):
         for c in range(cols):
             a = pos + side * (-half_w + c * cell) + fwd * (r - 1) * cell

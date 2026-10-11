@@ -76,6 +76,8 @@ def main() -> None:
     ap.add_argument("--name", default="RockyCoaster")
     ap.add_argument("--out", type=Path, default=ROOT / "out" / "mods")
     ap.add_argument("--extra", type=Path, help="folder of additional cooked legacy files (UNION/Content/...) to include")
+    ap.add_argument("--new-stages", help="move the mod off --stage onto these new stage ids (e.g. 3001,3002,3003; "
+                    "pipeline.relocate_stage): the stock stage stays untouched")
     args = ap.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -104,6 +106,14 @@ def main() -> None:
                 shutil.copy(f, dst)
             print(f"added {len(files)} cooked files from {args.extra}")
 
+        if args.new_stages:
+            from pipeline.relocate_stage import relocate
+            copies = relocate(staging, args.stage, [int(x) for x in args.new_stages.split(",")], music=args.name)
+            # the game streams only level packages its registry knows
+            from pipeline.asset_registry import write_pak
+            args.out.mkdir(parents=True, exist_ok=True)
+            write_pak(copies, args.out / f"zzz_{args.name}_Registry_P.pak")
+
         args.out.mkdir(parents=True, exist_ok=True)
         utoc = args.out / f"zzz_{args.name}_P.utoc"
         subprocess.run([str(RETOC), "to-zen", "--version", "UE5_4", str(staging), str(utoc)], check=True)
@@ -119,7 +129,9 @@ def main() -> None:
         for fname, suffix in ASSETS.items():
             src = args.converted / fname
             if src.exists():
-                got = next(check.rglob(f"{args.stage}_{suffix}.uexp"))
+                from pipeline.relocate_stage import CONTENT_PREFIX
+                stage_name = f"{CONTENT_PREFIX}{args.new_stages.split(',')[0]}" if args.new_stages else args.stage
+                got = next(check.rglob(f"{stage_name}_{suffix}.uexp"), None) or next(check.rglob(f"{args.stage}_{suffix}.uexp"))
                 assert extract_payload(got.read_bytes())[1] == src.read_bytes(), f"{suffix} differs after IoStore round trip"
         print("IoStore round trip OK")
 

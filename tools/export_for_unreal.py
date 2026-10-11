@@ -226,6 +226,10 @@ def quat_matrix(q):
                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
 
 
+# item.Forest trees placed on the road that racers pop (orange and red balloons): their animated export
+# also gets ASR's pop (<label>_Hit.fbx) and the idle loop's extent (<label>.bounds.json) for the break
+# objects (ue_build_level)
+BREAKABLE_TREES = (4, 5)
 HIT_EFFECTS = ("burst", "flash", "soundwave", "blinn2")  # pop sprites (T_Balloon_Burst, FLASH...), the loudspeakers' pulse (SOUND_WAVE, HEAT_HAZE planes ~25 m wide, scaled by the animation)
 
 
@@ -250,8 +254,12 @@ def place_item_instances():
         rot, pos = quat_matrix(loc["rotation"]), np.array(loc["position"], np.float64)
         for tmpl in templates.get(loc["tree"], []):
             mat = tmpl.data.materials[0].name.lower() if tmpl.data.materials and tmpl.data.materials[0] else ""
-            if any(k in mat for k in HIT_EFFECTS):
+            hit_effect = any(k in mat for k in HIT_EFFECTS)
+            if hit_effect and loc["tree"] not in BREAKABLE_TREES and "soundwave" not in mat:
                 continue  # shown by the "Hit" animation only; the looping "Auto" one leaves them visible
+            # The loudspeakers' sound wave (SOUND_WAVE) stays: placed copies play their loop without scale and
+            # visibility (which decode wrongly, see asr.anim.branch_worlds), so it shows at rest size and
+            # scrolls out of the speaker with ASR's texture animation. Its heat-haze ring (blinn2) stays out.
             ob = tmpl.copy()
             ob.data = tmpl.data.copy()
             ob.name = f"track.Forest_item{i}_t{loc['tree']}"
@@ -259,6 +267,7 @@ def place_item_instances():
             ob.data.vertices.foreach_get("co", co)
             ob.data.vertices.foreach_set("co", (co.reshape(-1, 3) @ rot.T + pos).astype(np.float32).ravel())
             ob["item_instance"] = i
+            ob["hit_effect"] = hit_effect  # breakable objects keep them for their "Hit" animation
             bpy.context.scene.collection.objects.link(ob)
             placed += 1
     for obs in templates.values():
@@ -355,7 +364,57 @@ def uv_motion(values: np.ndarray):
         iv = int(round(values[0, 1] * nv)) % nv
         phase = (iu + nu * iv) - (changes[0] + 1) / ANIM_FPS / period % 1.0 + 1.0  # index at t = 0
         return ("flip", period, phase, nu, nv)
-    return ("pan", np.median(np.diff(values, axis=0), axis=0) * ANIM_FPS)
+    rate = np.median(np.diff(values, axis=0), axis=0)
+    ratchet = uv_ratchet(values)
+    if ratchet:
+        return ratchet
+    net = (values[-1] - values[0]) / max(1, len(values) - 1)
+    # Slides with holds (the billboard's screen moves to the next frame, then pauses): the median step is
+    # 0 and the screen stood still; such pieces scroll at their average rate instead.
+    rate = np.where(np.abs(rate) < 1e-6, net, rate)
+    return ("pan", rate * ANIM_FPS)
+
+
+def uv_ratchet(values: np.ndarray):
+    """Ratchets (the billboard's screen: six images stacked along V; the loop holds each one, then slides the
+    next one in): ("flip", ...) over the held images (sliding along V, else switching halfway through), or None.
+    (Averaged into a scroll the screen crept ~0.004 per second: still in game.)"""
+    for axis in (0, 1):
+        v, other = values[:, axis], values[:, 1 - axis]
+        if np.ptp(other) > 1e-3:
+            continue
+        speed = np.abs(np.diff(v))
+        moving = speed > 0.15 * speed.max()  # the holds wobble slightly (spline overshoot)
+        if moving.mean() > 0.7 or not moving.any():
+            continue
+        levels = []
+        for x in np.sort(np.round(v[:-1][~moving] % 1.0, 3)):
+            if not levels or x - levels[-1] > 0.01:
+                levels.append(x)
+        if len(levels) > 1 and 1.0 - levels[-1] + levels[0] < 0.01:
+            levels.pop()  # 1.0 is 0 again
+        if len(levels) < 2:
+            continue
+        frames = int(round(1.0 / min(np.diff(levels))))
+        if frames > 16 or any(abs(x * frames - round(x * frames)) > 0.05 for x in levels):
+            continue
+        # images stepped through per loop: the net change (the billboard: 0 -> 1 = all six), else the slides
+        steps = int(round(abs(v[-1] - v[0]) * frames))
+        slides = steps if steps else int(np.sum(moving[1:] & ~moving[:-1]) + moving[0])
+        period = (len(values) - 1) / ANIM_FPS / max(1, slides)
+        first = int(round(v[0] * frames))
+        if axis == 1:
+            # the slide itself (in game an instant switch looked wrong): from leaving one image to resting on
+            # the next, as a share of each step, passed in the fractional part of the row count (nv + slide / 2,
+            # ue_build_level.texture_uv eases between images over it); the step ends with the slide
+            step = np.sign(v[-1] - v[0]) / frames
+            start = int(np.argmax(np.abs(v - v[0]) >= 0.02 / frames))
+            end = start + int(np.argmax(np.abs(v[start:] - (v[0] + step)) <= 0.02 / frames))
+            slide = min(0.98, (end - start) / ANIM_FPS / period)
+            return ("flip", period, first + 1.0 - end / ANIM_FPS / period, 1, frames + slide / 2)
+        switch = int(np.argmax(np.abs(v - v[0]) >= 0.5 / frames)) / ANIM_FPS
+        return ("flip", period, first + 1.0 - switch / period, frames, 1)
+    return None
 
 
 def attach_texture_motion():
@@ -370,20 +429,22 @@ def attach_texture_motion():
         meshes = json.load(open(base + ".materials.json"))["meshes"]
         uv = {}
         for tree in json.load(open(base + ".anims.json"))["trees"]:
-            if tree["forest_name"] != "track.Forest" or not tree["animations"]:
+            if tree["forest_name"] not in ("track.Forest", "item.Forest") or not tree["animations"]:
                 continue
             for (kind, index, channel), values in decode(tree["animations"][0]).items():
                 if kind == "uv" and channel == 1 and len(values) > 1:
-                    uv[(tree["tree"], index)] = uv_motion(values)
+                    uv[(tree["forest_name"], tree["tree"], index)] = uv_motion(values)
         for ob in bpy.data.objects:
             meta = meshes[ob["asr_mesh"]] if "asr_mesh" in ob else None
-            if meta and not meta["name"].startswith("track.Forest"):
-                continue  # placed item copies: their tree numbers are item.Forest's, not the track's
-            if meta and meta["uv_matrix"] != 255 and (meta["tree"], meta["matrix_index"]) in uv:
-                motion[ob.name] = uv[(meta["tree"], meta["matrix_index"])]
+            if not meta:
+                continue
+            # placed item copies (the speaker's sound waves...) keep item.Forest's tree numbers
+            forest = "item.Forest" if meta["name"].startswith("item.Forest") else "track.Forest"
+            if meta["uv_matrix"] != 255 and (forest, meta["tree"], meta["matrix_index"]) in uv:
+                motion[ob.name] = uv[(forest, meta["tree"], meta["matrix_index"])]
             for slot in (1, 2):
-                idx = meta["matrix_indices"][slot] if meta and "matrix_indices" in meta else 255
-                m = uv.get((meta["tree"], idx)) if idx != 255 else None
+                idx = meta["matrix_indices"][slot] if "matrix_indices" in meta else 255
+                m = uv.get((forest, meta["tree"], idx)) if idx != 255 else None
                 if m and m[0] == "pan":
                     layer_pans[(ob.name, slot)] = m[1]
     kinds = __import__("collections").Counter()
@@ -479,6 +540,51 @@ def fcurve(action, ob, path, index):
     return action.fcurves.new(path, index=index)
 
 
+HIT_FRAMES = 60  # breakable objects' "Hit" animation, cut (ASR's pop is over by frame 16)
+
+
+def write_action(arm_ob, action_name, bones, basis, frames):
+    """Action with one constant key per frame and bone from per-frame matrices relative to the bone's rest."""
+    action = bpy.data.actions.new(action_name)
+    arm_ob.animation_data.action = action
+    fr = np.arange(frames, dtype=np.float64)
+    for b in bones:
+        pb = arm_ob.pose.bones[f"b{b}"]
+        pb.rotation_mode = "QUATERNION"
+        k = basis[b]
+        loc = k[:, :3, 3]
+        rotm, scale = polar(k[:, :3, :3])
+        rot = matrix_to_quat(rotm)
+        for path, values in ((f'pose.bones["b{b}"].location', loc), (f'pose.bones["b{b}"].rotation_quaternion', rot),
+                             (f'pose.bones["b{b}"].scale', scale)):
+            for i in range(values.shape[1]):
+                fc = fcurve(action, arm_ob, path, i)
+                fc.keyframe_points.add(frames)
+                fc.keyframe_points.foreach_set("co", np.stack([fr, values[:, i]], 1).astype(np.float32).ravel())
+                fc.keyframe_points.foreach_set("interpolation", [0] * frames)  # constant: one key per frame
+                fc.update()
+    return action
+
+
+def export_skinned(arm_ob, mesh_ob, path, frames):
+    scene = bpy.context.scene
+    scene.render.fps = ANIM_FPS
+    scene.frame_start, scene.frame_end = 0, frames - 1
+    bpy.ops.object.select_all(action="DESELECT")
+    arm_ob.select_set(True)
+    mesh_ob.select_set(True)
+    bpy.context.view_layer.objects.active = arm_ob
+    bpy.ops.export_scene.fbx(filepath=path, use_selection=True, apply_unit_scale=True,
+                             apply_scale_options="FBX_SCALE_UNITS", axis_forward="X", axis_up="Z",
+                             bake_space_transform=False, mesh_smooth_type="FACE", path_mode="COPY",
+                             embed_textures=True, use_mesh_modifiers=False, colors_type="SRGB",
+                             add_leaf_bones=False, primary_bone_axis="Y", secondary_bone_axis="X",
+                             armature_nodetype="NULL", bake_anim=True, bake_anim_use_all_bones=True,
+                             bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
+                             bake_anim_force_startend_keying=True, bake_anim_step=1.0,
+                             bake_anim_simplify_factor=0.0)
+
+
 def export_animated_trees() -> set:
     base = os.path.splitext(obj_path)[0]
     if not (os.path.exists(base + ".anims.json") and os.path.exists(base + ".materials.json")):
@@ -518,10 +624,27 @@ def export_animated_trees() -> set:
         if L is not None:  # item template: tree space -> the locator's place in the track
             rest = L @ rest
             world = L @ world
+        breakable = L is not None and tree_id in BREAKABLE_TREES
+        if breakable:
+            # The star balloons' idle loop decodes badly (it lingers at the bottom, jumps at the loop point and
+            # wobbles +-5 degrees about the up axis; in game the bob looked irregular and some balloons turned):
+            # a steady sine bob instead, the decoded loop's height and length, starting at the bottom (where the
+            # break object's collision box sits), the frame-0 pose otherwise (no rotation).
+            bones_all = sorted({b for _, b in members})
+            height = max(float(np.ptp(world[:, b, 1, 3])) for b in bones_all)
+            phase = np.arange(len(world)) / len(world)
+            lift = height * (1 - np.cos(2 * np.pi * phase)) / 2
+            steady = np.repeat(world[:1], len(world), axis=0)
+            steady[:, :, 1, 3] += lift[:, None]
+            world = steady
+            # the pop sprites show in "Hit" only (Auto's type-4 visibility decodes swapped: forced off)
+            for ob, b in members:
+                if ob.get("hit_effect"):
+                    visible[:, b] = False
         frames = anim["frames"]
         bones = sorted({b for _, b in members})
         moving = [b for b in bones if np.abs(world[:, b] - world[:1, b]).max() > 1e-4 or not visible[:, b].all()]
-        if not moving:
+        if not moving and not breakable:
             continue
         # skin matrices per frame and bone, in these Blender coordinates
         # Each bone rests at its piece (rest position and rotation): ASR
@@ -540,6 +663,40 @@ def export_animated_trees() -> set:
             bind[b][:3, 3] = (M @ rest[b])[:3, 3]
             basis[b] = np.linalg.inv(bind[b]) @ skin @ bind[b]        # relative to the bone's rest
             basis[b][~visible[:, b], :3, :3] *= 1e-4
+        if breakable:  # extent of the idle loop (visible pieces), these Blender coordinates
+            per_frame = {}
+            for ob, b in members:
+                co = np.empty(len(ob.data.vertices) * 3, np.float64)
+                ob.data.vertices.foreach_get("co", co)
+                co = co.reshape(-1, 3)
+                for f in range(0, frames, 3):
+                    if visible[f, b]:
+                        k = M @ world[f, b] @ np.linalg.inv(rest[b]) @ M_inv
+                        per_frame.setdefault(f, []).append(co @ k[:3, :3].T + k[:3, 3])
+            per_frame = {f: np.concatenate(p) for f, p in per_frame.items()}
+            pts = np.concatenate(list(per_frame.values()))
+            f_low = min(per_frame, key=lambda f: per_frame[f][:, 2].min())  # the balloon at the bottom of its bob
+            low = per_frame[f_low]
+            bounds = (pts.min(0), pts.max(0), low.min(0), low.max(0))
+            # the break object's static mesh (shown until hit), posed there; pop sprites left out
+            copies = []
+            for ob, b in members:
+                if ob.get("hit_effect"):
+                    continue
+                cp = ob.copy()
+                cp.data = ob.data.copy()
+                bpy.context.scene.collection.objects.link(cp)
+                k = M @ world[f_low, b] @ np.linalg.inv(rest[b]) @ M_inv
+                co = np.empty(len(cp.data.vertices) * 3, np.float64)
+                cp.data.vertices.foreach_get("co", co)
+                cp.data.vertices.foreach_set("co", (co.reshape(-1, 3) @ k[:3, :3].T + k[:3, 3]).astype(np.float32).ravel())
+                cp.data.update()
+                copies.append(cp)
+            export(copies, os.path.join(out_dir, f"{name}_{label}_Static.fbx"))
+            for cp in copies:
+                data = cp.data
+                bpy.data.objects.remove(cp, do_unlink=True)
+                bpy.data.meshes.remove(data)
         bpy.ops.object.select_all(action="DESELECT")
         for ob, b in members:
             vg = ob.vertex_groups.new(name=f"b{b}")
@@ -568,41 +725,29 @@ def export_animated_trees() -> set:
         mod = mesh_ob.modifiers.new("Armature", "ARMATURE")
         mod.object = arm_ob
         arm_ob.animation_data_create()
-        action = bpy.data.actions.new(f"A_{label}")
-        arm_ob.animation_data.action = action
-        fr = np.arange(frames, dtype=np.float64)
-        for b in bones:
-            pb = arm_ob.pose.bones[f"b{b}"]
-            pb.rotation_mode = "QUATERNION"
-            k = basis[b]
-            loc = k[:, :3, 3]
-            rotm, scale = polar(k[:, :3, :3])
-            rot = matrix_to_quat(rotm)
-            for path, values in ((f'pose.bones["b{b}"].location', loc), (f'pose.bones["b{b}"].rotation_quaternion', rot),
-                                 (f'pose.bones["b{b}"].scale', scale)):
-                for i in range(values.shape[1]):
-                    fc = fcurve(action, arm_ob, path, i)
-                    fc.keyframe_points.add(frames)
-                    fc.keyframe_points.foreach_set("co", np.stack([fr, values[:, i]], 1).astype(np.float32).ravel())
-                    fc.keyframe_points.foreach_set("interpolation", [0] * frames)  # constant: one key per frame
-                    fc.update()
-        scene = bpy.context.scene
-        scene.render.fps = ANIM_FPS
-        scene.frame_start, scene.frame_end = 0, frames - 1
+        action = write_action(arm_ob, f"A_{label}", bones, basis, frames)
         path = os.path.join(out_dir, f"{name}_{label}.fbx")
-        bpy.ops.object.select_all(action="DESELECT")
-        arm_ob.select_set(True)
-        mesh_ob.select_set(True)
-        bpy.context.view_layer.objects.active = arm_ob
-        bpy.ops.export_scene.fbx(filepath=path, use_selection=True, apply_unit_scale=True,
-                                 apply_scale_options="FBX_SCALE_UNITS", axis_forward="X", axis_up="Z",
-                                 bake_space_transform=False, mesh_smooth_type="FACE", path_mode="COPY",
-                                 embed_textures=True, use_mesh_modifiers=False, colors_type="SRGB",
-                                 add_leaf_bones=False, primary_bone_axis="Y", secondary_bone_axis="X",
-                                 armature_nodetype="NULL", bake_anim=True, bake_anim_use_all_bones=True,
-                                 bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
-                                 bake_anim_force_startend_keying=True, bake_anim_step=1.0,
-                                 bake_anim_simplify_factor=0.0)
+        export_skinned(arm_ob, mesh_ob, path, frames)
+        if breakable:
+            # ASR's pop (type-1 "Hit": balloon hidden from frame 4, burst sprite frames 4-16, flash 2-12),
+            # cut before its last frames (the burst toggles back on at 280), as <label>_Hit.fbx on the same
+            # skeleton; full decode (scale + visibility) on the idle loop's rest pose
+            hit = next(a for a in tree["animations"] if a["name"] == "Hit")
+            _, world_h, visible_h = branch_worlds(tree, hit, motion_only=False)
+            world_h, visible_h = (L @ world_h)[:HIT_FRAMES], visible_h[:HIT_FRAMES]
+            basis_h = {}
+            for b in bones:
+                skin = M @ world_h[:, b] @ np.linalg.inv(rest[b]) @ M_inv
+                basis_h[b] = np.linalg.inv(bind[b]) @ skin @ bind[b]
+                basis_h[b][~visible_h[:, b], :3, :3] *= 1e-4
+            action_h = write_action(arm_ob, f"A_{label}_Hit", bones, basis_h, len(world_h))
+            arm_ob.animation_data.action = action_h
+            export_skinned(arm_ob, mesh_ob, os.path.join(out_dir, f"{name}_{label}_Hit.fbx"), len(world_h))
+            bpy.data.actions.remove(action_h)
+            arm_ob.animation_data.action = action
+            json.dump({"min": bounds[0].tolist(), "max": bounds[1].tolist(),
+                       "low_min": bounds[2].tolist(), "low_max": bounds[3].tolist()},
+                      open(os.path.join(out_dir, f"{name}_{label}.bounds.json"), "w"))
         print(f"wrote {path} ({len(bones)} bones, {frames} frames, {len(members)} pieces)")
         exported.add(key)
         # Free everything right away: state left over from many exports crashed Blender's exporter.
@@ -615,7 +760,8 @@ def export_animated_trees() -> set:
     return exported
 
 
-for old in glob.glob(os.path.join(out_dir, f"{name}_Anim_t*.fbx")):
+for old in (glob.glob(os.path.join(out_dir, f"{name}_Anim_t*.fbx")) + glob.glob(os.path.join(out_dir, f"{name}_Break_t*.fbx"))
+            + glob.glob(os.path.join(out_dir, f"{name}_Anim_t*.bounds.json"))):
     os.remove(old)
 animated = export_animated_trees()
 print(f"animated trees exported: {sorted(animated)}")

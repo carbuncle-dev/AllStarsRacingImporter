@@ -8,3 +8,4 @@ __pycache__/
 tools/bin/
 .pytest_cache/
 .vscode/
+release/

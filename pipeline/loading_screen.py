@@ -31,7 +31,8 @@ from PIL import Image
 from pipeline.ue_build import ENGINE, PROJECT, ROOT
 
 GAME_CONTENT = PROJECT.parent / "Content"
-TEXTURES = ("01_Union/UI/System/Texture_StageBG/UI_StageBG{id}", "01_Union/UI/System/Texture_StageTmb/UI_StageTmb{id}")
+TEXTURES = ("01_Union/UI/System/Texture_StageBG/UI_StageBG{id}", "01_Union/UI/System/Texture_StageTmb/UI_StageTmb{id}",
+            "01_Union/UI/System/Texture_StageRing/UI_StageRing{id}")  # Ring: 1024^2 square course picture
 OUT = ROOT / "out" / "ui_cooked"
 ISPC = ENGINE / "Engine" / "Binaries" / "ThirdParty" / "Intel" / "ISPCTexComp" / "Win64-Release" / "ispc_texcomp.dll"
 

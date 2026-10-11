@@ -41,9 +41,21 @@ COMMON = ["-unattended", "-nosplash", "-nop4", "-nosound", "-stdout", "-FullStdO
 def run_editor(args: list[str], log_name: str, env: dict | None = None) -> str:
     LOGS.mkdir(parents=True, exist_ok=True)
     log = LOGS / log_name
-    with open(log, "w", encoding="utf-8", errors="replace") as f:
-        proc = subprocess.run([str(EDITOR), str(PROJECT), *args, *COMMON], stdout=f, stderr=subprocess.STDOUT,
-                              env={**os.environ, **(env or {})})
+    # The editor sometimes dies while loading its modules (access violation in UnionRun right after the Steam
+    # SDK loads, before any script runs; intermittent, 2026-10-11 -- the machine's random crashes): such a
+    # start is retried, up to three times.
+    for attempt in range(3):
+        with open(log, "w", encoding="utf-8", errors="replace") as f:
+            proc = subprocess.Popen([str(EDITOR), str(PROJECT), *args, *COMMON], stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, env={**os.environ, **(env or {})},
+                                    text=True, encoding="utf-8", errors="replace")
+            for line in proc.stdout:
+                f.write(line)
+            proc.wait()
+        head = log.read_text(encoding="utf-8", errors="replace").split("=== Critical error: ===")
+        if proc.returncode == 0 or len(head) < 2 or "LogPython: [" in head[0] or "Steam SDK Loaded!" not in head[0][-400:]:
+            break
+        print(f"{log_name}: the editor crashed while starting (attempt {attempt + 1}), retrying")
     text = log.read_text(encoding="utf-8", errors="replace")
     errors = [l for l in text.splitlines() if "Error:" in l and "LogWindows" not in l]
     print(f"{log_name}: exit {proc.returncode}, {len(errors)} error lines (log: {log})")
@@ -75,7 +87,7 @@ def convert_textures(unreal_dir: Path) -> Path:
     out_dir.mkdir(exist_ok=True)
     converted = {}
     for info in materials.values():
-        for key in ("texture", "ripple", "env", "layer2", "sparkle"):
+        for key in ("texture", "ripple", "env", "layer2", "sparkle", "glow"):
             src = info.get(key)
             if not src:
                 continue
@@ -100,11 +112,63 @@ def convert_textures(unreal_dir: Path) -> Path:
 EXPOSURE = 2 ** (9.0 - math.log2(4.0 ** 2 * 60.0)) / 1.2
 
 
+def ensure_editor_plugin() -> None:
+    """Install and compile tools/ue_plugin/AsrEditorTools (editor-only: Anim Blueprint authoring) in the
+    editor project. Built alone (-Module): a full target build wants to rebuild every module, and UE 5.4's
+    shared PCHs fail under MSVC 14.42. -Module builds write no module manifest: it is written here with the
+    editor's BuildId."""
+    src = ROOT / "tools" / "ue_plugin" / "AsrEditorTools"
+    dst = ENGINE / "UNION" / "Plugins" / "AsrEditorTools"
+    dll = dst / "Binaries" / "Win64" / "UnrealEditor-AsrEditorTools.dll"
+    newest = max(p.stat().st_mtime for p in src.rglob("*") if p.is_file())
+    if dll.exists() and dll.stat().st_mtime >= newest:
+        return
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    build_bat = ENGINE / "Engine" / "Build" / "BatchFiles" / "Build.bat"
+    log = LOGS / "plugin_build.log"
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(log, "w", encoding="utf-8", errors="replace") as f:
+        proc = subprocess.run([str(build_bat), "UNIONEditor", "Win64", "Development", f"-Project={PROJECT}",
+                               "-Module=AsrEditorTools", "-WaitMutex"], stdout=f, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise SystemExit(f"AsrEditorTools build failed, see {log}")
+    build_id = json.loads((ENGINE / "UNION" / "Binaries" / "Win64" / "UnrealEditor.modules").read_text())["BuildId"]
+    (dll.parent / "UnrealEditor.modules").write_text(json.dumps(
+        {"BuildId": build_id, "Modules": {"AsrEditorTools": dll.name}}, indent="	"))
+    print(f"built editor plugin AsrEditorTools ({log})")
+
+
+def break_ground(track_dir: Path, stage: str) -> dict:
+    """UE height of our road under each placed object (locator i), for the break objects' heights."""
+    loc_path = next(track_dir.glob("*.locators.json"), None)
+    if loc_path is None:
+        return {}
+    from cw.collision import parse_collision
+    from pipeline.asr_to_cw import drivable_triangles
+    from pipeline.retarget_actors import Route, _on_road
+    conv = track_dir / f"cw_{stage}"
+    a = json.loads((conv / "align.json").read_text())
+    rot, off = np.array(a["rotation"]), np.array(a["offset"])
+    road = drivable_triangles(parse_collision((conv / "Lap_Collision.bin").read_bytes()))
+    route = Route((conv / "Lap_Navigation.bin").read_bytes(), road)
+    return {str(i): float(_on_road(rot @ np.array(r["position"]) + off, route, 0.0)[0][2])
+            for i, r in enumerate(json.loads(loc_path.read_text()))}
+
+
 def build(track_dir: Path, stage: str, name: str) -> None:
     unreal_dir = track_dir / "unreal"
     cfg = {
         "fbx": str(next(unreal_dir.glob("*_Visual.fbx")).resolve()),
-        "animated_fbx": [str(p.resolve()) for p in sorted(unreal_dir.glob("*_Anim_t*.fbx"))],
+        "animated_fbx": [str(p.resolve()) for p in sorted(unreal_dir.glob("*_Anim_t*.fbx"))
+                         if not p.stem.endswith(("_Hit", "_Static"))],
+        # ASR's balloons as CrossWorlds break objects (export_for_unreal BREAKABLE_TREES): their pop animation
+        # and idle-loop extent, by animated label
+        "break_objects": {p.stem.split("_Anim_")[0] + "_Anim_" + p.stem.split("_Anim_")[1][:-len("_Hit")]: {
+            "hit_fbx": str(p.resolve()),
+            "static_fbx": str(p.with_name(p.stem[:-len("_Hit")] + "_Static.fbx").resolve()),
+            "bounds": json.loads(p.with_name(p.stem[:-len("_Hit")] + ".bounds.json").read_text())}
+            for p in sorted(unreal_dir.glob("*_Anim_t*_Hit.fbx"))},
+        "break_ground": break_ground(track_dir, stage),
         # loop start of objects placed by ASR's logic (pipeline.asr_objects): "Anim_t<tree>_i<n>" -> fraction
         "anim_start": {f"Anim_t{r['tree']}_i{i}": r.get("start", 0.0) for i, r in enumerate(
             json.loads(next(track_dir.glob("*.locators.json")).read_text()))} if any(track_dir.glob("*.locators.json")) else {},
@@ -131,6 +195,10 @@ def build(track_dir: Path, stage: str, name: str) -> None:
         "lighting": {"post_process": {"auto_exposure_method": "AEM_MANUAL", "auto_exposure_bias": 9.0,
                                       "bloom_method": "BM_SOG", "bloom_intensity": 1.0, "bloom_threshold": 1.0},
                      "post_process_unbound": True, "post_process_priority": -100.0,
+                     # Sun yaw: Metal Harbor's (30) shines from 210 deg, straight behind the racers on our grid
+                     # (they face 0 deg): the intro cameras, which look at their faces, saw them dark. The
+                     # CustomGrandPrix UE4SS mod turns our directional lights by 180 deg for the intro only
+                     # (the scenery is unlit: they only light racers and items) and back for the race.
                      "sun": 15.0, "sun_color": [253 / 255, 224 / 255, 179 / 255], "sun_rotation": [-32.87, 30.0],
                      "sky_fill": sky_fill.fit(5.0)},
         # ASR's colours are final on-screen colours (lighting baked in), so the unlit scenery is scaled by
@@ -147,6 +215,7 @@ def build(track_dir: Path, stage: str, name: str) -> None:
     old_level = content / level_path(stage).replace("/Game/", "").replace("/", os.sep)
     for ext in (".umap", ".uexp"):
         Path(str(old_level) + ext).unlink(missing_ok=True)
+    ensure_editor_plugin()
     cfg_path = unreal_dir / "build_config.json"
     cfg_path.write_text(json.dumps(cfg, indent=2))
     text = run_editor([f"-ExecutePythonScript={ROOT / 'tools' / 'ue_build_level.py'}", "-nullrhi"], "ue_build.log",
@@ -287,7 +356,7 @@ def patch_course_map(extra: Path, stage: str, track_dir: Path, margin: float = 0
 
 
 def package(track_dir: Path, stage: str, name: str, portal_height: float = 1.0,
-            add: list[Path] | None = None) -> None:
+            add: list[Path] | None = None, new_stages: str | None = None) -> None:
     content = COOKED / "UNION" / "Content"
     level_dir = content / "01_Union" / "Map" / "Stage_NotNX" / stage
     asset_dir = content / "ASR" / name
@@ -308,8 +377,11 @@ def package(track_dir: Path, stage: str, name: str, portal_height: float = 1.0,
         patch_travel_ring_height(extra, stage, portal_height)
     n = sum(1 for _ in extra.rglob("*.uasset")) + sum(1 for _ in extra.rglob("*.umap"))
     print(f"staged {n} cooked packages from {content}")
-    subprocess.run(["python", "-m", "pipeline.package_mod", str(track_dir / f"cw_{stage}"), "--stage", stage,
-                    "--name", name, "--extra", str(extra)], check=True, cwd=ROOT)
+    cmd = ["python", "-m", "pipeline.package_mod", str(track_dir / f"cw_{stage}"), "--stage", stage,
+           "--name", name, "--extra", str(extra)]
+    if new_stages:
+        cmd += ["--new-stages", new_stages]
+    subprocess.run(cmd, check=True, cwd=ROOT)
 
 
 def main() -> None:
@@ -321,6 +393,8 @@ def main() -> None:
     ap.add_argument("--portal-height", type=float, default=1.0,
                     help="scale for the stage's travel-ring height above the road (0.5 = half as high)")
     ap.add_argument("--add", type=Path, action="append", help="folder of extra cooked files to include")
+    ap.add_argument("--new-stages", help="ship the track as these new stage ids (custom Grand Prix, e.g. "
+                    "3001,3002,3003) instead of replacing --stage (pipeline.relocate_stage)")
     args = ap.parse_args()
     steps = args.steps.split(",")
     if "build" in steps:
@@ -328,7 +402,7 @@ def main() -> None:
     if "cook" in steps:
         cook(args.stage)
     if "package" in steps:
-        package(args.track_dir, args.stage, args.name, args.portal_height, args.add)
+        package(args.track_dir, args.stage, args.name, args.portal_height, args.add, args.new_stages)
 
 
 if __name__ == "__main__":

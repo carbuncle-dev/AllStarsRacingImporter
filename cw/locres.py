@@ -89,6 +89,35 @@ class Locres:
             self.strings[e.index] = text
 
 
+def key_hash(s: str) -> int:
+    """Namespace / key hash (FLocKey::ProduceHash): CityHash64 of the UTF-16 text, folded like GetTypeHash(uint64)."""
+    from cityhash import CityHash64
+    v = CityHash64(s.encode("utf-16-le"))
+    return ((v & 0xFFFFFFFF) + (v >> 32) * 23) & 0xFFFFFFFF
+
+
+def source_hash(s: str) -> int:
+    """Source-string hash (FTextLocalizationResource::HashString = FCrc::StrCrc32): CRC-32 over 4-byte
+    characters. The game's string-table entries use their key as source (every stock entry matches)."""
+    import zlib
+    return zlib.crc32(s.encode("utf-32-le"))
+
+
+def add_text(loc: Locres, namespace: str, key: str, source: str, text: str) -> None:
+    """Add (or replace) a localisation for an FText (namespace, key) whose source string is `source`: the game
+    only uses an entry whose source hash matches the text's current source."""
+    ns = next((n for n in loc.namespaces if n.name == namespace), None)
+    if ns is None:
+        ns = Namespace(key_hash(namespace), namespace, not namespace.isascii())
+        loc.namespaces.append(ns)
+    wide = not text.isascii()
+    loc.strings.append(text)
+    loc.refcounts.append(1)
+    loc.wide.append(wide)
+    entry = Entry(key_hash(key), key, not key.isascii(), source_hash(source), len(loc.strings) - 1)
+    ns.entries = [e for e in ns.entries if e.key != key] + [entry]
+
+
 def parse_locres(d: bytes) -> Locres:
     if d[:16] != MAGIC or d[16] != 3:
         raise ValueError("unsupported locres (need version 3)")

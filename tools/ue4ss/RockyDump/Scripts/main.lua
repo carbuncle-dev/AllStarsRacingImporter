@@ -321,6 +321,43 @@ local function dumpCameras()
     end
 end
 
+-- The balloons (native break objects, tools/ue_build_level.py): visibility of each mesh, break state and
+-- collision body. Only plain fields and calls already used safely elsewhere: reading the anim instance /
+-- asset pointers crashed UE4SS (2026-10-10). Every value is flushed as it is read, so a crash still
+-- shows how far it got.
+local function dumpBreakObjects()
+    local function put(s) out:write(s); out:flush() end
+    put("\n##### BREAK OBJECTS\n")
+    local objs = safe(function() return FindAllOf("BreakObjectBase") end) or {}
+    put("live: " .. #objs .. "\n")
+    for i = 1, math.min(#objs, 12) do
+        local a = objs[i]
+        local l = safe(function() return a:K2_GetActorLocation() end)
+        put(string.format("%d | (%.0f, %.0f, %.0f)", i, l and l.X or 0, l and l.Y or 0, l and l.Z or 0))
+        put(" | isBreak " .. tostring(safe(function() return a.isBreak end)))
+        put(" | isRelocate " .. tostring(safe(function() return a.isRelocate end)))
+        put(" | RelocateTimer " .. tostring(safe(function() return a.RelocateTimer end)))
+        put(" | IsBroken " .. tostring(safe(function() return a:IsBroken() end)) .. "\n")
+        for _, cn in ipairs({ "StaticMeshComponent", "SkeletalMeshComponent", "StaticBodyComponent" }) do
+            local c = safe(function() return a[cn] end)
+            if c and safe(function() return c:IsValid() end) then
+                put("   " .. cn)
+                put(" visible " .. tostring(safe(function() return c:IsVisible() end)))
+                put(" hiddenInGame " .. tostring(safe(function() return c.bHiddenInGame end)))
+                if cn == "SkeletalMeshComponent" then
+                    put(" playing " .. tostring(safe(function() return c:IsPlaying() end)))
+                    put(" position " .. tostring(safe(function() return c:GetPosition() end)))
+                end
+                if cn == "StaticBodyComponent" then
+                    put(" domain " .. tostring(safe(function() return c.DomainNumber end)))
+                    put(" enabled " .. tostring(safe(function() return c:IsCollisionEnabled() end)))
+                end
+                put("\n")
+            end
+        end
+    end
+end
+
 local function dumpAll()
     dumpIndex = dumpIndex + 1
     out = io.open(OUT_DIR .. "dump_" .. os.date("%H%M%S") .. "_" .. dumpIndex .. ".txt", "w")
@@ -338,6 +375,7 @@ local function dumpAll()
         end
     end
     out:flush()
+    safe(dumpBreakObjects)
     if CAMERA_PP_ONLY then
         safe(dumpCameras)
         out:close()

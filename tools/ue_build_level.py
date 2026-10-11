@@ -15,6 +15,7 @@ config.json:
 """
 
 import json
+import math
 import os
 import re
 import zlib
@@ -57,16 +58,24 @@ def import_task(filename, dest, options=None, name=None, factory=None):
 
 # --- Textures -----------------------------------------------------------------
 materials = json.load(open(cfg["materials"]))
-textures = sorted({p for m in materials.values() for p in (m["texture"], m.get("ripple"), m.get("env"), m.get("layer2"), m.get("sparkle")) if p})
+textures = sorted({p for m in materials.values() for p in (m["texture"], m.get("ripple"), m.get("env"), m.get("layer2"), m.get("sparkle"), m.get("glow")) if p})
 tex_names = {p: "T_" + re.sub(r"\W", "_", os.path.splitext(os.path.basename(p))[0]) for p in textures}
 # The classic TextureFactory imports synchronously; Interchange finishes asynchronously, so most
 # textures weren't ready (or saved) by the time materials referenced them.
 tools.import_asset_tasks([import_task(p, f"{ROOT}/Textures", name=n, factory=unreal.TextureFactory())
                           for p, n in tex_names.items()])
 tex_assets = {}
+# UE auto-detects mostly-blue textures as normal maps (two-channel compression, no sRGB): the speakers'
+# light-blue sound wave (SOUND_WAVE) came out lime green in game. Only the water's ripple maps are
+# normal maps here; everything else is colour.
+ripples = {m.get("ripple") for m in materials.values() if m.get("ripple")}
 for p, n in tex_names.items():
     asset = unreal.load_asset(f"{ROOT}/Textures/{n}")
     if asset:
+        if p not in ripples and asset.get_editor_property("compression_settings") == unreal.TextureCompressionSettings.TC_NORMALMAP:
+            asset.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_DEFAULT)
+            asset.set_editor_property("srgb", True)
+            log(f"texture {n}: auto-detected as a normal map, set back to colour")
         tex_assets[p] = asset
 # Our meshes have no texture-streaming data, so the game kept them at low mips; load full res.
 for tex in tex_assets.values():
@@ -136,6 +145,7 @@ def asr_lighting(mat, rgb):
 # material is used instead). So each master comes twice: static (all channels) and "_Skin" (UV0-UV3:
 # texture, vertex colour, pan; no flipbook) for the animated trees.
 SKINNED = False
+LAST_FLIP = None  # flipbook offset node of the material being built (texture_uv)
 
 
 def new_material(name, blend, shading, two_sided):
@@ -189,21 +199,39 @@ def texture_uv(mat):
     phase = one_minus(comp(f1, "g", -2050, -80), -1950, -80)
     nu_raw = comp(f2, "r", -2050, 20)
     nu = binary(mat, unreal.MaterialExpressionMax, nu_raw, expr(mat, C, -2050, 100, r=1.0), -1900, 40)
-    nv = binary(mat, unreal.MaterialExpressionMax, one_minus(comp(f2, "g", -2050, 160), -1950, 160),
+    # rows: integer part; the fractional part x 2 = share of each step spent sliding to the next row (the
+    # billboard's screen; 0 = an instant switch)
+    nv_raw = one_minus(comp(f2, "g", -2050, 160), -1950, 160)
+    nv = binary(mat, unreal.MaterialExpressionMax, unary(unreal.MaterialExpressionFloor, nv_raw, -1950, 200),
                 expr(mat, C, -2050, 240, r=1.0), -1900, 180)
-    n = unary(unreal.MaterialExpressionFloor,
-              binary(mat, unreal.MaterialExpressionAdd,
-                     binary(mat, unreal.MaterialExpressionDivide, time, period, -1750, -250), phase, -1650, -200),
-              -1550, -200)
+    slide = binary(mat, unreal.MaterialExpressionMultiply, unary(unreal.MaterialExpressionFrac, nv_raw, -1950, 300),
+                   expr(mat, C, -2050, 340, r=2.0), -1850, 300)
+    steps = binary(mat, unreal.MaterialExpressionAdd,
+                   binary(mat, unreal.MaterialExpressionDivide, time, period, -1750, -250), phase, -1650, -200)
+    n = unary(unreal.MaterialExpressionFloor, steps, -1550, -200)
+    # eased slide over the last `slide` of the step: s = smoothstep(saturate((frac - 1 + slide) / slide))
+    into = binary(mat, unreal.MaterialExpressionDivide,
+                  binary(mat, unreal.MaterialExpressionAdd,
+                         binary(mat, unreal.MaterialExpressionSubtract, unary(unreal.MaterialExpressionFrac, steps, -1550, 300),
+                                expr(mat, C, -1550, 380, r=1.0), -1450, 320), slide, -1350, 320),
+                  binary(mat, unreal.MaterialExpressionMax, slide, expr(mat, C, -1450, 440, r=0.001), -1350, 420), -1250, 340)
+    s = unary(unreal.MaterialExpressionSaturate, into, -1150, 340)
+    eased = binary(mat, unreal.MaterialExpressionMultiply, binary(mat, unreal.MaterialExpressionMultiply, s, s, -1050, 340),
+                   binary(mat, unreal.MaterialExpressionSubtract, expr(mat, C, -1150, 440, r=3.0),
+                          binary(mat, unreal.MaterialExpressionMultiply, s, expr(mat, C, -1150, 500, r=2.0), -1050, 480),
+                          -950, 440), -900, 360)
     cols = binary(mat, unreal.MaterialExpressionDivide, n, nu, -1450, -150)
     fu = unary(unreal.MaterialExpressionFrac, cols, -1350, -150)
     fv = unary(unreal.MaterialExpressionFrac,
-               binary(mat, unreal.MaterialExpressionDivide, unary(unreal.MaterialExpressionFloor, cols, -1350, -60),
-                      nv, -1250, -60), -1150, -60)
+               binary(mat, unreal.MaterialExpressionDivide,
+                      binary(mat, unreal.MaterialExpressionAdd, unary(unreal.MaterialExpressionFloor, cols, -1350, -60),
+                             eased, -1300, -20), nv, -1250, -60), -1150, -60)
     neg_v = binary(mat, unreal.MaterialExpressionMultiply, fv, expr(mat, C, -1150, 20, r=-1.0), -1050, -40)
     valid = unary(unreal.MaterialExpressionSaturate, nu_raw, -1550, 60)  # 0 when the piece has no flipbook
     flip = binary(mat, unreal.MaterialExpressionMultiply,
                   binary(mat, unreal.MaterialExpressionAppendVector, fu, neg_v, -950, -100), valid, -850, -60)
+    global LAST_FLIP
+    LAST_FLIP = flip  # the glow layer steps with the same flipbook (glow_layer)
     return binary(mat, unreal.MaterialExpressionAdd,
                   binary(mat, unreal.MaterialExpressionAdd, uv0, scroll, -800, -350), flip, -650, -200)
 
@@ -226,6 +254,38 @@ def emissive_scale(mat, colour, x=-100, y=150):
     return scenery_gain(mat, binary(mat, unreal.MaterialExpressionMultiply, colour, k, x, y), x + 150, y)
 
 
+def glow_layer(mat, colour):
+    """ASR's self-illumination layer (a material's "_L" / "_LE" texture, texture flags 1157 / 1173; the cave's
+    glowing bones, the billboard's screen frames): Glow x GlowScale added to the colour. The layer sits in
+    texture slot 1 or 2 and scrolls with that slot's own UV animation ("Pan2" UV6 / "Pan3" UV7,
+    export_for_unreal); GlowSlot2 = 1 picks slot 2's. It also steps with the piece's flipbook (the billboard's
+    screen images and their glow change together; zero for pieces without one). Default: black (no glow)."""
+    one2 = expr(mat, unreal.MaterialExpressionConstant2Vector, -2200, 2100, r=0.0, g=1.0)
+    time = expr(mat, unreal.MaterialExpressionTime, -2200, 2200)
+    uv0 = expr(mat, unreal.MaterialExpressionTextureCoordinate, -2200, 2300, coordinate_index=0)
+
+    def scrolled(channel, y):
+        rate = expr(mat, unreal.MaterialExpressionTextureCoordinate, -2200, y, coordinate_index=channel)
+        off = binary(mat, unreal.MaterialExpressionMultiply,
+                     binary(mat, unreal.MaterialExpressionSubtract, rate, one2, -2050, y), time, -1900, y)
+        return binary(mat, unreal.MaterialExpressionAdd,
+                      binary(mat, unreal.MaterialExpressionAdd, uv0, off, -1750, y), LAST_FLIP, -1650, y)
+
+    pick = expr(mat, unreal.MaterialExpressionScalarParameter, -1750, 2700, parameter_name="GlowSlot2",
+                default_value=0.0)
+    uv = expr(mat, unreal.MaterialExpressionLinearInterpolate, -1550, 2500)
+    link(scrolled(6, 2400), "", uv, "A")
+    link(scrolled(7, 2600), "", uv, "B")
+    link(pick, "", uv, "Alpha")
+    glow = expr(mat, unreal.MaterialExpressionTextureSampleParameter2D, -1350, 2500, parameter_name="Glow",
+                texture=unreal.load_asset("/Engine/EngineResources/Black"))
+    link(uv, "", glow, "UVs")
+    k = expr(mat, unreal.MaterialExpressionScalarParameter, -1350, 2700, parameter_name="GlowScale",
+             default_value=1.0)
+    return binary(mat, unreal.MaterialExpressionAdd, colour,
+                  binary(mat, unreal.MaterialExpressionMultiply, glow, k, -1150, 2550, a_out="RGB"), -400, 300)
+
+
 def master(name, blend, shading, two_sided, vertex_lighting=False):
     mat = new_material(name, blend, shading, two_sided)
     tex = expr(mat, unreal.MaterialExpressionTextureSampleParameter2D, -400, 0, parameter_name="BaseColor")
@@ -237,6 +297,8 @@ def master(name, blend, shading, two_sided, vertex_lighting=False):
     else:
         colour = binary(mat, unreal.MaterialExpressionMultiply, tex, expr(mat, unreal.MaterialExpressionConstant,
                                                                            -350, 150, r=1.0), -200, 100, a_out="RGB")
+    if not SKINNED and shading == UNLIT:
+        colour = glow_layer(mat, colour)
     mel.connect_material_property(emissive_scale(mat, colour), "", target)
     if blend == unreal.BlendMode.BLEND_MASKED:
         mel.connect_material_property(tex, "A", unreal.MaterialProperty.MP_OPACITY_MASK)
@@ -448,6 +510,12 @@ def make_instance(name, skinned):
         mel.set_material_instance_texture_parameter_value(mi, "BaseColor", tex_assets[info["texture"]])
     if info.get("emissive_scale"):
         mel.set_material_instance_scalar_parameter_value(mi, "EmissiveScale", float(info["emissive_scale"]))
+    if info.get("glow") in tex_assets and kind in ("opaque", "masked", "unlit") and not skinned:
+        mel.set_material_instance_texture_parameter_value(mi, "Glow", tex_assets[info["glow"]])
+        mel.set_material_instance_scalar_parameter_value(mi, "GlowSlot2", 1.0 if info.get("glow_slot") == 2 else 0.0)
+        mel.set_material_instance_scalar_parameter_value(mi, "GlowScale", float(info.get("glow_scale", 1.0)))
+    if kind == "additive" and info.get("intensity"):  # faint beams (pipeline.unreal_materials)
+        mel.set_material_instance_scalar_parameter_value(mi, "Intensity", float(info["intensity"]))
     if kind in ("additive", "waterfall") and not skinned:
         if info.get("layer2") in tex_assets:
             mel.set_material_instance_texture_parameter_value(mi, "Layer2", tex_assets[info["layer2"]])
@@ -501,8 +569,12 @@ for mesh in meshes:
         mesh.set_material(i, mi)
 log(f"imported {len(meshes)} static meshes; unmatched material slots: {sorted(missing)[:10]}")
 
+
 # --- Animated trees (export_for_unreal: <name>_Anim_t<tree>.fbx, skinned mesh + looping animation) -----
 animated = []
+BREAK_OBJECTS = cfg.get("break_objects", {})
+hit_sequences = {}
+static_meshes = {}
 for fbx in cfg.get("animated_fbx", []):
     aui = unreal.FbxImportUI()
     aui.set_editor_property("import_mesh", True)
@@ -550,6 +622,40 @@ for fbx in cfg.get("animated_fbx", []):
         mats[i] = m
     sk.set_editor_property("materials", mats)
     animated.append((label, sk, seq))
+    if label in BREAK_OBJECTS and seq:
+        # the break object's pop ("Hit", export_for_unreal) onto the same skeleton
+        hui = unreal.FbxImportUI()
+        hui.set_editor_property("import_mesh", False)
+        hui.set_editor_property("import_as_skeletal", True)
+        hui.set_editor_property("mesh_type_to_import", unreal.FBXImportType.FBXIT_ANIMATION)
+        hui.set_editor_property("import_animations", True)
+        hui.set_editor_property("import_materials", False)
+        hui.set_editor_property("import_textures", False)
+        hui.set_editor_property("skeleton", sk.get_editor_property("skeleton"))
+        had = hui.anim_sequence_import_data
+        had.set_editor_property("import_uniform_scale", 100.0)
+        had.set_editor_property("convert_scene", True)
+        had.set_editor_property("force_front_x_axis", False)
+        had.set_editor_property("remove_redundant_keys", False)
+        had.set_editor_property("animation_length", unreal.FBXAnimationLengthImportType.FBXALIT_EXPORTED_TIME)
+        hdest = f"{dest}/Hit"
+        tools.import_asset_tasks([import_task(BREAK_OBJECTS[label]["hit_fbx"], hdest, hui)])
+        hit = next((unreal.load_asset(str(a.package_name) + "." + str(a.asset_name))
+                    for a in unreal.AssetRegistryHelpers.get_asset_registry().get_assets_by_path(hdest)
+                    if str(a.asset_class_path.asset_name) == "AnimSequence"), None)
+        if hit:
+            hit_sequences[label] = hit
+        # its static mesh (the balloon at the bottom of its bob), shown by the break object until hit
+        stask = import_task(BREAK_OBJECTS[label]["static_fbx"], f"{dest}/Static", ui)
+        tools.import_asset_tasks([stask])
+        for mesh in [unreal.load_asset(p) for p in stask.imported_object_paths]:
+            if isinstance(mesh, unreal.StaticMesh):
+                for i, slot in enumerate(mesh.static_materials):
+                    mi = instances.get(norm(str(slot.material_slot_name)))
+                    if mi is not None:
+                        mesh.set_material(i, mi)
+                static_meshes[label] = mesh
+        log(f"{label}: pop animation {hit}, static mesh {static_meshes.get(label)}")
 log(f"imported {len(animated)} animated trees ({sum(1 for _, _, q in animated if q)} with animation)")
 
 # --- Level --------------------------------------------------------------------
@@ -571,6 +677,8 @@ for mesh in meshes:
 # (sun 6, sky 1) under the game's exposure, so these are stronger. Only lit objects use them.
 LIGHT = cfg.get("lighting", {})
 for label, sk, seq in animated:
+    if label in hit_sequences:
+        continue  # a break object (below)
     a = actors.spawn_actor_from_class(unreal.SkeletalMeshActor, unreal.Vector(0, 0, 0))
     a.set_actor_label(label)
     comp = a.skeletal_mesh_component
@@ -593,6 +701,135 @@ for label, sk, seq in animated:
         if start:
             play.set_editor_property("saved_position", start * seq.get_editor_property("sequence_length"))
         comp.set_editor_property("animation_data", play)
+
+# ASR's balloons pop when a racer hits them: CrossWorlds' native break object (ABreakObjectBase, the class
+# behind the stock breakable rocks). In game it shows the static mesh (here the balloon at the bottom of its
+# bob) until hit, then hides it (and its collision) -- a skeletal mesh alone stayed invisible -- and leaves
+# the break visuals to its Blueprint's OnPlayBreakAnimation event (the stock rock's Blueprint implements it).
+# BP_ASR_BalloonBreak (generated by the AsrEditorTools plugin, tools/ue_plugin) shows the skeletal mesh there
+# and plays it from the start: ASR's pop ("Hit": balloon gone at frame 4, burst sprite, flash).
+# Its collision body sits in domain 0 (the main course): the default, "invalid", never collided (the first
+# try, a VAT break object, did nothing in game). The balloons are lowered so the bottom of their bob rests
+# BREAK["lift"] cm above our road (their bob starts ~7 m up, out of reach); the box covers the balloon there.
+BREAK = cfg.get("break_object", {})
+break_class = None
+if hit_sequences:
+    bp = unreal.AsrAnimTools.make_play_on_event_blueprint(f"{ROOT}/Blueprints", "BP_ASR_BalloonBreak",
+                                                         unreal.BreakObjectBase.static_class(),
+                                                         "OnPlayBreakAnimation", "SkeletalMeshComponent")
+    if bp is None:
+        log("BP_ASR_BalloonBreak FAILED")
+    else:
+        eal.save_loaded_asset(bp)
+        break_class = bp.generated_class()
+
+
+def break_centre(label):
+    lo, hi = BREAK_OBJECTS[label]["bounds"]["low_min"], BREAK_OBJECTS[label]["bounds"]["low_max"]
+    return ((lo[0] + hi[0]) * 50, -(lo[1] + hi[1]) * 50)  # Unreal x, y (cm)
+
+
+# The balloons' bob phase: ASR's rows of three alternate -- the first row's outer balloons low while its middle
+# one is high, the second row the other way round (the outer two of a row always level). Rows are the balloons
+# within 30 m of each other, in lap order (ASR's locator numbers run along the lap); the bob starts at its
+# bottom, so "high" = half a loop in.
+break_phase = {}
+break_labels = sorted((l for l, _, _ in animated if l in hit_sequences), key=lambda l: int(l.rsplit("_i", 1)[-1]))
+rows = []
+for l in break_labels:
+    row = next((r for r in rows if math.dist(break_centre(r[0]), break_centre(l)) < 3000), None)
+    row.append(l) if row else rows.append([l])
+for k, row in enumerate(rows):
+    mid = [sum(break_centre(l)[i] for l in row) / len(row) for i in (0, 1)]
+    middle = min(row, key=lambda l: math.dist(break_centre(l), mid))
+    for l in row:
+        high = (l == middle) == (k % 2 == 0)
+        break_phase[l] = 0.5 if high else 0.0
+log(f"balloon rows: {[[(l.split('_Anim_')[-1], break_phase[l]) for l in r] for r in rows]}")
+# Each row hangs level, as in ASR: its balloons' low point at the same height, BREAK["lift"] above the highest
+# road under the row (lowered one by one, a row on a slope came out uneven in game).
+row_bottom = {}
+for row in rows:
+    grounds = [cfg.get("break_ground", {}).get(l.rsplit("_i", 1)[-1]) for l in row]
+    if all(g is not None for g in grounds):
+        for l in row:
+            row_bottom[l] = max(grounds) + float(BREAK.get("lift", 30.0))
+
+for label, sk, seq in animated:
+    if label not in hit_sequences or break_class is None:
+        continue
+    # the balloon at the bottom of its bob (it floats ~10 m up and down): the collision body can't follow
+    # the animation, so it covers the balloon where a kart can reach it
+    lo, hi = BREAK_OBJECTS[label]["bounds"]["low_min"], BREAK_OBJECTS[label]["bounds"]["low_max"]
+    # Blender (x, y, z) m -> Unreal (x, -y, z) cm (FBX export + import)
+    lo_ue = [lo[0] * 100, -hi[1] * 100, lo[2] * 100]
+    hi_ue = [hi[0] * 100, -lo[1] * 100, hi[2] * 100]
+    c = [(l + h) / 2 for l, h in zip(lo_ue, hi_ue)]
+    e = [(h - l) / 2 for l, h in zip(lo_ue, hi_ue)]
+    ground = cfg.get("break_ground", {}).get(label.rsplit("_i", 1)[-1])
+    shift = ground + float(BREAK.get("lift", 30.0)) - lo_ue[2] if ground is not None else 0.0
+    if label in row_bottom:
+        shift = row_bottom[label] - lo_ue[2]
+    a = actors.spawn_actor_from_class(break_class, unreal.Vector(c[0], c[1], c[2] + shift))
+    a.set_actor_label(label)
+    comp = a.get_editor_property("skeletal_mesh_component")
+    comp.set_skeletal_mesh_asset(sk) if hasattr(comp, "set_skeletal_mesh_asset") else comp.set_skeletal_mesh(sk)
+    comp.set_editor_property("relative_location", unreal.Vector(-c[0], -c[1], -c[2]))  # vertices are absolute
+    comp.set_editor_property("visible_in_real_time_sky_captures", False)
+    comp.set_editor_property("visibility_based_anim_tick_option",
+                             unreal.VisibilityBasedAnimTickOption.ALWAYS_TICK_POSE_AND_REFRESH_BONES)
+    comp.set_editor_property("bounds_scale", 4.0)
+    comp.set_editor_property("animation_mode", unreal.AnimationMode.ANIMATION_SINGLE_NODE)
+    # ASR's idle bob, looping (phase: break_phase); the mod (CustomGrandPrix) shows this
+    # skeletal mesh instead of the static one, switches it to the pop (<label>/Hit/<label>_Hit_Anim) on a hit
+    # and back to this loop when the balloon returns. Without the mod the static balloon shows, as before.
+    play = unreal.SingleAnimationPlayData()
+    play.set_editor_property("anim_to_play", seq or hit_sequences[label])
+    play.set_editor_property("saved_looping", bool(seq))
+    play.set_editor_property("saved_playing", bool(seq))
+    start = break_phase.get(label, 0.0)
+    if seq and start:
+        play.set_editor_property("saved_position", start * seq.get_editor_property("sequence_length"))
+    comp.set_editor_property("animation_data", play)
+    if seq:
+        # The cook packs only what the level references: the pop animation (played by the mod) is kept by a
+        # hidden actor holding it (with the balloon idle in the break object, the pop went missing in game).
+        holder = actors.spawn_actor_from_class(unreal.SkeletalMeshActor, unreal.Vector(c[0], c[1], c[2] + shift))
+        holder.set_actor_label(f"{label}_PopHolder")
+        hc = holder.skeletal_mesh_component
+        hc.set_skeletal_mesh_asset(sk) if hasattr(hc, "set_skeletal_mesh_asset") else hc.set_skeletal_mesh(sk)
+        hc.set_editor_property("animation_mode", unreal.AnimationMode.ANIMATION_SINGLE_NODE)
+        hold = unreal.SingleAnimationPlayData()
+        hold.set_editor_property("anim_to_play", hit_sequences[label])
+        hold.set_editor_property("saved_playing", False)
+        hc.set_editor_property("animation_data", hold)
+        hc.set_collision_enabled(unreal.CollisionEnabled.NO_COLLISION)
+        hc.set_editor_property("hidden_in_game", True)
+        hc.set_editor_property("visible", False)
+        holder.set_actor_hidden_in_game(True)
+    if label in static_meshes:
+        smc = a.get_editor_property("static_mesh_component")
+        smc.set_static_mesh(static_meshes[label])
+        smc.set_editor_property("relative_location", unreal.Vector(-c[0], -c[1], -c[2]))
+        smc.set_editor_property("visible_in_real_time_sky_captures", False)
+    body = a.get_editor_property("static_body_component")
+    body.set_editor_property("body_type", unreal.StaticBodyShapeType.STATIC_BODY_BOX)
+    box = unreal.StaticBodyBoxParam()
+    # a little larger than the balloon: it pops when the kart touches it, not once inside
+    k = float(BREAK.get("body_scale", 1.1))
+    box.set_editor_property("half_extents", unreal.Vector(e[0] * k, e[1] * k, e[2]))
+    body.set_editor_property("box_param", box)
+    body.set_editor_property("domain_number", unreal.DomainNumber.DOMAIN_NUMBER0)
+    for prop, value in (("break_condition_type", unreal.BreakConditionType.ALL),
+                        ("break_damage_type", unreal.BreakDamageType.NONE),
+                        ("is_break", True),
+                        ("is_relocate", True),
+                        # back after 2 s (5 s felt far too long; ASR's own time lives in its code)
+                        ("relocate_timer", float(BREAK.get("relocate_seconds", 2.0)))):
+        a.set_editor_property(prop, value)
+    origin, extent = a.get_actor_bounds(False)
+    log(f"break object {label}: centre {[round(v) for v in c]} half {[round(v) for v in e]} lowered {shift:.0f} cm, "
+        f"actor bounds {origin} +- {extent}")
 
 pitch, yaw = LIGHT.get("sun_rotation", [-50.0, 30.0])
 sun = actors.spawn_actor_from_class(unreal.DirectionalLight, unreal.Vector(0, 0, 50000),

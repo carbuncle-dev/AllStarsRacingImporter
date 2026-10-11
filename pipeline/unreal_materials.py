@@ -23,6 +23,28 @@ SOFT_ALPHA = 0.3         # share of partially transparent texels above which a m
 ADDITIVE = ("waterfall", "lightfog")   # material name parts drawn additively
 GLOWING = ("light_ani",)                # SAMBA_H_LIGHT bulbs
 GLOW = 2.5                              # their emissive brightness
+BEAM_PEAK = 0.2                         # brightest part of a coloured spotlight beam, x its colour
+GOD_RAYS = 0.4                          # skeleton cave light shafts (lightfog): full strength was too bright, 0.15 too weak
+# The last cave's coloured light shafts (light_lambert93) share the skeleton cave beams' texture; at the
+# beams' boost they were far too strong there (ASR also darkens both by grey vertex colour, ~0.6)
+LAST_CAVE_SHAFTS = {"light_lambert93": 0.5}  # 0.8 was still a bit strong
+# Glow layers that are a copy of their material's picture (the billboard screen, the last cave's wooden
+# walls): added at full strength they washed out (the walls made the last cave far too bright in game)
+DIM_GLOW = {"billboard": 0.3, "mountwood": 0.3}
+SPEAKER_WAVE_TINT = [0.85, 1.15, 1.45, 1.0]  # the loudspeakers' sound wave (SOUND_WAVE): light blue
+SPEAKER_WAVE_GAIN = 2.5                 # its opacity boost (texture alpha <= 0.62, vertex alpha 0.42)
+
+
+ALPHA_LAYER = 277  # ASR texture flags of a material's separate alpha (opacity) layer
+
+
+GLOW_LAYER = (1157, 1173)  # ASR texture flags of a material's self-illumination layer
+
+
+def asr_alpha_tested(mat: dict) -> bool:
+    """Whether ASR cuts the material out by its texture's alpha: the record's unknown[5] is 2 for the alpha
+    tested ones (fences, skeleton figures, flags; 4 for blended effects) and 0 for opaque ones."""
+    return mat["unknown"][5] != 0
 
 
 def main() -> None:
@@ -68,6 +90,16 @@ def main() -> None:
         masked, soft = alpha.get(p, (False, 0.0))
         info = {"texture": str(p) if p else None, "masked": masked, "kind": "masked" if masked else "opaque"}
         mat = asr["materials"].get(m)
+        mask = next((t["name"] for t in mat["textures"] if t["flags"] == ALPHA_LAYER), None) if mat else None
+        if p and mask and asr_texture(mask):
+            # A separate alpha layer (the balloon's burst skin: the colour texture torn by BALLOON_BURST_ALPHA,
+            # which ASR scrolls across it): one cut-out texture, the layer's alpha as the colour's alpha
+            # (the scroll is not reproduced).
+            combined = folder / f"{p.stem}__{Path(mask).stem}.png"
+            rgb = Image.open(p).convert("RGB")
+            a_layer = Image.open(asr_texture(mask)).convert("RGBA").getchannel("A").resize(rgb.size)
+            Image.merge("RGBA", (*rgb.split(), a_layer)).save(combined)
+            info.update(texture=str(combined.resolve()), masked=True, kind="masked")
         if mat and mat["psflags"] == WATER_FLAGS:
             # ASR water: no colour texture -- vertex colour and alpha, a ripple normal map (the
             # texture the OBJ references, pink) bending a sparkle/highlight map (flags 128).
@@ -97,8 +129,35 @@ def main() -> None:
                     info["layer2"] = asr_texture(layer2)
                 if sparkle and asr_texture(sparkle):
                     info["sparkle"] = asr_texture(sparkle)
+        if "lightfog" in m.lower() and info["kind"] == "additive":
+            info["intensity"] = GOD_RAYS
+        if "soundwave" in m.lower():
+            # ASR's speaker wave: a light, see-through blue. Its grey-blue stripes at their own faint opacity
+            # tinted the yellow scenery green (alpha blended) or yellow (additive): drawn like the waterfall
+            # veils, tinted light blue with a raised opacity
+            info.update(kind="waterfall", masked=False, tint=SPEAKER_WAVE_TINT, alpha_gain=SPEAKER_WAVE_GAIN)
         if any(k in m.lower() for k in GLOWING):
             info["emissive_scale"] = GLOW  # ASR's coloured light bulbs shine (and switch colour: flipbook)
+        if mat and info["kind"] == "masked" and mat["unknown"][5] == 4 and p:
+            # ASR blends these (unknown[5] = 4): the cave's coloured spotlight beams, whose alpha stays
+            # under 0.11 -- as cut-outs they vanished entirely. Additive, colour x alpha, scaled so the
+            # strongest part of a beam reaches a quarter of its colour (half was too strong in game, a quarter still a bit).
+            peak = float(np.asarray(Image.open(p).convert("RGBA").getchannel("A")).max()) / 255
+            if 0 < peak < 0.5:
+                info.update(kind="additive", masked=False, intensity=LAST_CAVE_SHAFTS.get(m, round(BEAM_PEAK / peak, 2)))
+        if mat and info["kind"] == "masked" and info["masked"] and not asr_alpha_tested(mat):
+            # ASR draws this material opaque: its texture's alpha is unused (the signboards' white
+            # backgrounds came out see-through as cut-outs)
+            info.update(kind="opaque", masked=False)
+        if mat and info["kind"] in ("opaque", "masked"):
+            # ASR's self-illumination layer ("_L" / "_LE": the cave's glowing bones and track, the
+            # billboard's screen frames), added to the colour by the masters' Glow parameter
+            glow = next(((i, t["name"]) for i, t in enumerate(mat["textures"]) if t["flags"] in GLOW_LAYER), None)
+            if glow and glow[0] in (1, 2) and asr_texture(glow[1]):
+                info.update(glow=asr_texture(glow[1]), glow_slot=glow[0])
+                for part, scale in DIM_GLOW.items():
+                    if part in m.lower():
+                        info["glow_scale"] = scale
         out[m] = info
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out, indent=1))

@@ -107,3 +107,81 @@ def field_offset(buf: bytes, row: int, column: str) -> tuple[int, str]:
                 return 8 + at, fmt
             at += struct.calcsize(fmt)
     raise KeyError(column)
+
+
+def build_utf(table: UtfTable, blob_align: int = 1) -> bytes:
+    """Serialize a table (the layout CRI's tools write: header, columns, rows, string pool starting with the
+    table name, data area). With blob_align > 1 the data area starts at a multiple of it (counted from the
+    '@UTF' magic) and every blob is placed at a multiple of it -- top-level ACB/ACF tables use 32, which keeps
+    an embedded memory AWB aligned."""
+    strings = bytearray()
+    string_at: dict[str, int] = {}
+
+    def string(s: str) -> int:
+        if s not in string_at:
+            string_at[s] = len(strings)
+            strings.extend(s.encode("utf-8") + b"\0")
+        return string_at[s]
+
+    string(table.name)
+    for col in table.columns:
+        string(col.name)
+    blobs: list[bytes] = []
+
+    def encode(typ: int, value) -> tuple[bytes, object]:
+        if typ == 0xA:
+            return b"", ("str", string(value or ""))
+        if typ == 0xB:
+            blobs.append(bytes(value or b""))
+            return b"", ("blob", len(blobs) - 1)
+        return struct.pack(FORMATS[typ], value), None
+
+    # pass 1: strings and blob order (column defaults first, then rows), so offsets are known
+    col_parts = []
+    for col in table.columns:
+        part = [struct.pack(">B", col.flags), ("str", string(col.name))]
+        if col.flags & 0x20:
+            raw, ref = encode(col.type, col.default)
+            part.append(raw if ref is None else ref)
+        col_parts.append(part)
+    row_parts = []
+    for row in table.rows:
+        parts = []
+        for col in table.columns:
+            if col.per_row:
+                raw, ref = encode(col.type, row[col.name])
+                parts.append(raw if ref is None else ref)
+        row_parts.append(parts)
+
+    columns_size = sum(5 + (struct.calcsize(FORMATS[c.type]) if c.flags & 0x20 else 0) for c in table.columns)
+    width = sum(struct.calcsize(FORMATS[c.type]) for c in table.columns if c.per_row)
+    rows_off = 24 + columns_size
+    strings_off = rows_off + width * len(table.rows)
+    data_off = strings_off + len(strings)
+    if blob_align > 1:
+        data_off += (-(8 + data_off)) % blob_align
+    blob_at, data = [], bytearray()
+    for b in blobs:
+        if blob_align > 1 and b:
+            data.extend(b"\0" * ((-len(data)) % blob_align))
+        blob_at.append((len(data) if b else 0, len(b)))
+        data.extend(b)
+
+    def resolve(p) -> bytes:
+        if isinstance(p, bytes):
+            return p
+        kind, i = p
+        return struct.pack(">I", i) if kind == "str" else struct.pack(">II", *blob_at[i])
+
+    body = bytearray(struct.pack(">HHIIIHHI", table.version, rows_off, strings_off, data_off, 0,
+                                 len(table.columns), width, len(table.rows)))
+    for part in col_parts:
+        body += b"".join(resolve(p) for p in part)
+    assert len(body) == rows_off
+    for parts in row_parts:
+        body += b"".join(resolve(p) for p in parts)
+    body += strings
+    body += b"\0" * (data_off - len(body))
+    body += data
+    body += b"\0" * ((-len(body)) % 8)
+    return b"@UTF" + struct.pack(">I", len(body)) + bytes(body)

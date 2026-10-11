@@ -113,6 +113,8 @@ else:
         view = views[state["view"]]
         if state["frames"] == 0:
             r = view["rotation"]
+            if "fov" in view:
+                comp.set_editor_property("fov_angle", float(view["fov"]))
             cap.set_actor_location_and_rotation(unreal.Vector(*view["location"]),
                                                 unreal.Rotator(roll=r[2], pitch=r[0], yaw=r[1]), False, False)
         state["frames"] += 1

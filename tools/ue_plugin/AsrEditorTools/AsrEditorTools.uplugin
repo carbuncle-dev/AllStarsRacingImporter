@@ -1,0 +1,17 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "ASR Editor Tools",
+	"Description": "Editor-only helpers for the AllStarsRacingImporter build scripts (never packaged).",
+	"Category": "Editor",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"Modules": [
+		{
+			"Name": "AsrEditorTools",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}

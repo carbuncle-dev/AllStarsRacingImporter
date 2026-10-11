@@ -53,7 +53,11 @@ HCA_KEY = 0x00720FB46101DF7A  # Sonic Racing CrossWorlds (vgmstream hca_keys.h);
 # Final lap: block 3 plays waveform 1 (3 s) while the announcer speaks, then block 4 starts the
 # final-lap song cue (waveform 4) at 3000 ms -- waveform 1 is the song's first 3 s ("final_lead") and
 # waveform 4 the rest of it, wrapping round to those 3 s, so the song runs through the transition.
-WAVES = {"stg1016": {0: "main", 3: "intro", 1: "final_lead", 4: "final", 2: "silence"}}
+# Block 4 also plays waveform 2 (5.3 s) from 3000 ms: in the stock sheet it is the same audio as the
+# start of waveform 4 (correlation 0.9998), carrying the music while the song cue itself is held down
+# after the announcer (FinalLapIntroVolumeKeep). Silenced, the music seemed to stop for seconds after
+# "FINAL LAP": it is that copy again ("final_overlap").
+WAVES = {"stg1016": {0: "main", 3: "intro", 1: "final_lead", 4: "final", 2: "final_overlap"}}
 FINAL_LEAD = {"stg1016": 1}  # waveform whose length the final-lap song starts with
 REROUTE = {"stg1016": {0: 11,   # BGM_ESTADIUM_1 (main song + stems) -> BGM_LISTEN_STG1016 (main song)
                        4: 11}}  # BGM_ESTADIUM_2 -> main song
@@ -198,12 +202,17 @@ def build(stage: str, songs: dict[str, str]) -> tuple[bytes, bytes]:
             jingle = song_pcm(songs["intro"])
             pcm, start = loudness(jingle + song_pcm(songs["main"])), len(jingle) // 4
             label = f"{songs['intro']} then {songs['main']}"
-        elif role in ("final_lead", "final"):
+        elif role in ("final_lead", "final", "final_overlap"):
             song = loudness(song_pcm(songs["final"]), FINAL_BOOST_DB)
             lead = 4 * waves[FINAL_LEAD[stage]]["NumSamples"]
-            pcm = song[:lead] if role == "final_lead" else song[lead:] + song[:lead]
+            if role == "final_lead":
+                pcm = song[:lead]
+            elif role == "final":
+                pcm = song[lead:] + song[:lead]
+            else:  # the same audio as the start of "final", played in sync with it (see WAVES)
+                pcm = song[lead:lead + 4 * w["NumSamples"]]
             start = 0 if w["LoopFlag"] == 2 else None
-            label = f"{songs['final']} ({'first' if role == 'final_lead' else 'after'} {lead // 4 / RATE:.1f} s)"
+            label = f"{songs['final']} ({role}, from {lead // 4 / RATE:.1f} s)"
         else:
             pcm, start, label = loudness(song_pcm(songs[role])), 0, songs[role]
         hca, n = encode_loop(pcm, subkey, start)
@@ -237,6 +246,21 @@ def build(stage: str, songs: dict[str, str]) -> tuple[bytes, bytes]:
     return bytes(acb), new_awb
 
 
+def sheet_asset(stock: str, ours: str) -> None:
+    """A cue-sheet asset for the shipped copy: the stock /Game/01_Union/Sound/Cue/<stock> asset renamed (same
+    length, package and CueSheetName) so it loads CriWareData/<ours>.acb. The CustomGrandPrix UE4SS mod loads it
+    while the custom cup is raced; the stock sheet stays as it is. Written to out/ui_cooked (packed by ue_build)."""
+    src = ROOT / "extracted" / "cw" / "alltables" / "UNION" / "Content" / "01_Union" / "Sound" / "Cue" / stock
+    dst = ROOT / "out" / "ui_cooked" / "UNION" / "Content" / "01_Union" / "Sound" / "Cue" / ours
+    assert len(stock) == len(ours)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    for ext in (".uasset", ".uexp"):
+        data = Path(str(src) + ext).read_bytes()
+        assert stock.encode() in data, (ext, stock)
+        Path(str(dst) + ext).write_bytes(data.replace(stock.encode(), ours.encode()))
+    print(f"cue sheet asset {ours} (copy of {stock})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--stage", default="stg1016")
@@ -244,6 +268,9 @@ def main() -> None:
     ap.add_argument("--song", default="Music_SA_MAIN_A", help="ASR song for the race (main and final lap)")
     ap.add_argument("--final", help="different ASR song for the final lap")
     ap.add_argument("--intro", default="Music_SA_INTRO", help="ASR song for the course intro")
+    ap.add_argument("--ambience", default="SAH", help="ASR track whose ambience replaces the stage's ('' = keep)")
+    ap.add_argument("--file-stage", help="ship the cue sheets under this stage name instead of replacing the stock "
+                    "ones (e.g. asr3001 -> BGM_ASR3001.acb; the CustomGrandPrix UE4SS mod loads them for the custom cup)")
     args = ap.parse_args()
     acb, awb = build(args.stage, {"main": args.song, "final": args.final or args.song, "intro": args.intro})
     stage_dir = ROOT / "out" / "music" / "CriWareData"
@@ -252,7 +279,36 @@ def main() -> None:
     (stage_dir / f"{name}.acb").write_bytes(acb)
     (stage_dir / f"{name}.awb").write_bytes(awb)
     response = stage_dir.parent / "files.txt"
-    response.write_text("".join(f'"{(stage_dir / f).resolve()}" "{MOUNT}{f}"\n' for f in (f"{name}.acb", f"{name}.awb")))
+    entries = [(stage_dir / f).resolve() for f in (f"{name}.acb", f"{name}.awb")]
+    if args.ambience:  # the stage's ambience cue sheet, with ASR's track ambience (pipeline.ambience)
+        from pipeline import ambience
+        se = ambience.build(args.stage, args.ambience)
+        dst = stage_dir / se.name
+        dst.write_bytes(se.read_bytes())
+        entries.append(dst.resolve())
+    stock, ours = args.stage.upper(), (args.file_stage or args.stage).upper()
+    assert len(ours) == len(stock), "the mod renames the sheet's file path in place: same length only"
+    lines = [f'"{p}" "{MOUNT}{p.name.replace(stock, ours)}"\n' for p in entries]
+    if args.file_stage:
+        # the track's own music label: BGM.acb branches to the renamed sheet, the label in the sound settings
+        from pipeline import bgm_label
+        from pipeline.custom_stage import bgm_label as stock_label, music_label
+        sheet_asset(f"BGM_{stock}", f"BGM_{ours}")
+        if args.ambience:  # the stage's own sound level, ambience cues and sheet (pipeline.ambience)
+            from pipeline import ambience
+            ambience.own_sound_chain(args.stage, args.file_stage, ROOT / "out" / "ui_cooked" / "UNION" / "Content")
+        files = bgm_label.build(music_label(int(ours[-4:]), args.name), stock_label(args.stage), f"BGM_{stock}",
+                                f"BGM_{ours}", acb)
+        cooked = ROOT / "out" / "ui_cooked" / "UNION" / "Content"
+        for rel, data in files.items():
+            dst = (stage_dir.parent / rel) if rel.startswith("CriWareData/") else cooked / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+            if rel.startswith("CriWareData/"):
+                lines = [l for l in lines if not l.rstrip().endswith(f'{rel.split("/")[1]}"')]
+                lines.append(f'"{dst.resolve()}" "{MOUNT}{dst.name}"\n')
+        print(f"music label {music_label(int(ours[-4:]), args.name)} added (BGM.acb, sound settings)")
+    response.write_text("".join(lines))
     pak = ROOT / "out" / "mods" / f"zzz_{args.name}_Music_P.pak"
     pak.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run([str(UNREALPAK), str(pak), f"-create={response}"], check=True, capture_output=True)
